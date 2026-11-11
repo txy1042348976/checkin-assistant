@@ -91,50 +91,46 @@ test('actual Node API separates public health from administrator access and reti
   assert.equal(f.runtime.store.accounts().length, 0);
 });
 
-test('dedicated import bearer authorizes one read-only save and cannot access the administrator API', async t => {
+test('retired browser authorization and import routes cannot save accounts or use bearer tickets', async t => {
   const f = await fixture(t);
   const start = await f.call('/api/login/start', { provider: 'anyrouter', method: 'manual', name: '本地 API 账号', interval_hours: 6 });
-  assert.equal(start.status, 202);
-  const pending = await start.json();
-  const route = '/api/browser-import/' + pending.id;
-  const auth = 'Bearer ' + pending.connection.ticket;
-  assert.equal((await fetch(f.url + route + '?ticket=' + pending.connection.ticket)).status, 401);
+  assert.equal(start.status, 410);
+  const auth = 'Bearer ' + 'a'.repeat(43);
   assert.equal((await fetch(f.url + '/api/bootstrap', { headers: { authorization: auth } })).status, 401);
-  assert.equal((await fetch(f.url + route, { headers: { authorization: auth, origin: 'https://untrusted.example' } })).status, 403);
-  assert.equal((await fetch(f.url + route, { method: 'HEAD', headers: { authorization: auth } })).status, 405);
-  const view = await fetch(f.url + route, { headers: { authorization: auth, origin: 'chrome-extension://' + 'a'.repeat(32) } });
-  assert.equal(view.status, 200);
-  const detail = await view.json(); assert.equal(detail.connection, undefined); assert.equal(detail.provider.id, 'anyrouter');
-  const badFormat = await fetch(f.url + route, { method: 'POST', headers: { authorization: auth, 'content-type': 'text/plain' }, body: '{}' });
-  assert.equal(badFormat.status, 415); assert.deepEqual(f.observed, []);
-  const saved = await fetch(f.url + route, { method: 'POST', headers: { authorization: auth, 'content-type': 'application/json' },
-    body: JSON.stringify({ session: 'fixture-site-private', api_user: '7' }) });
-  assert.equal(saved.status, 200);
-  const complete = await saved.json(); assert.equal(complete.status, 'success'); assert.equal(complete.connection, undefined);
-  assert.deepEqual(f.observed, [{ method: 'GET', cookie: 'session=fixture-site-private' }]);
-  assert.equal(f.runtime.store.accounts().length, 1); assert.equal(f.runtime.store.runs().length, 0);
-  assert.equal((await fetch(f.url + route, { headers: { authorization: auth } })).status, 410);
-  assert.equal(JSON.stringify(await f.call('/api/bootstrap').then(response => response.json())).includes('fixture-site-private'), false);
+  for (const route of ['/api/login/start', '/api/login/old-ticket', '/api/login/old-ticket/import', '/api/login/old-ticket/resume',
+    '/api/login/old-ticket/continue-oauth', '/api/browser-import/old-ticket', '/api/browser-import/old-ticket?ticket=old-ticket']) {
+    for (const method of ['GET', 'POST', 'HEAD']) {
+      const response = await fetch(f.url + route, { method, headers: { authorization: auth,
+        origin: 'chrome-extension://' + 'a'.repeat(32), ...(method === 'POST' ? { 'content-type': 'application/json' } : {}) },
+        ...(method === 'POST' ? { body: JSON.stringify({ session: 'fixture-site-private', api_user: '7' }) } : {}) });
+      assert.equal(response.status, 410, `${method} ${route}`);
+    }
+  }
+  assert.deepEqual(f.observed, []); assert.equal(f.runtime.store.accounts().length, 0); assert.equal(f.runtime.store.runs().length, 0);
+  const bootstrap = await f.call('/api/bootstrap').then(response => response.json());
+  assert.equal(bootstrap.authorization, null); assert.equal(bootstrap.web.authorization_mode, 'manual');
 });
 
-test('actual route integration applies authentication limits before parsing and preserves proxy secrets on reauthorization', async t => {
+test('actual route integration applies authentication limits before parsing and preserves proxy secrets on manual save', async t => {
   const f = await fixture(t);
   const large = await fetch(f.url + '/API/auth/login', { method: 'POST', headers: { origin: f.url, 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: 'x'.repeat(9000) }) });
   assert.equal(large.status, 413);
-  const protectedRoute = await fetch(f.url + '/api/login/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bad json' });
+  const protectedRoute = await fetch(f.url + '/api/accounts/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bad json' });
   assert.equal(protectedRoute.status, 401);
   const id = f.runtime.store.addAccount({ name: '原代理账号', provider: 'anyrouter', auth_mode: 'session', enabled: false, interval_hours: 6,
     session: 'fixture-original-session', api_user: '7', proxy: { mode: 'custom', server: 'http://127.0.0.1:9888', authenticate: true, username: 'fixture-user', password: 'fixture-proxy-private' } });
-  const response = await f.call('/api/login/start', { provider: 'anyrouter', method: 'manual', account_id: id, interval_hours: 6,
+  const response = await f.call('/api/accounts/import', { provider: 'anyrouter', name: '手动更新代理账号', account_id: id, interval_hours: 6,
+    session: 'fixture-new-private-session', api_user: '7', request_id: 'b'.repeat(32),
     proxy: { mode: 'custom', server: 'http://127.0.0.1:9888', authenticate: true, username: 'fixture-user' } });
-  assert.equal(response.status, 202);
-  const pending = await response.json();
-  const row = f.runtime.store.db.prepare('SELECT encrypted_context FROM browser_imports WHERE id=?').get(pending.id)!;
-  const context = f.runtime.store.decryptCredentials(String(row.encrypted_context));
-  assert.equal(context.proxy?.password, 'fixture-proxy-private');
-  assert.equal(JSON.stringify(pending).includes('fixture-proxy-private'), false);
-  assert.equal(f.runtime.imports.cancel(pending.id), true); assert.deepEqual(f.observed, []);
+  assert.equal(response.status, 200);
+  const saved = await response.json(); assert.equal(saved.account_id, id); assert.equal(saved.status, 'success');
+  const row = f.runtime.store.account(id)!, credentials = f.runtime.store.credentials(row);
+  assert.equal(credentials.proxy?.password, 'fixture-proxy-private'); assert.equal(credentials.proxy?.username, 'fixture-user');
+  assert.equal(credentials.session, 'fixture-new-private-session'); assert.equal(row.balance, null);
+  assert.equal(JSON.stringify(saved).includes('fixture-proxy-private'), false);
+  assert.equal(JSON.stringify(saved).includes('fixture-new-private-session'), false);
+  assert.deepEqual(f.observed, []); assert.equal(f.runtime.store.runs().length, 0); assert.equal(f.runtime.imports.current(), null);
 });
 
 test('an occupied server port fails without launching background scheduling and closes the new runtime', async t => {

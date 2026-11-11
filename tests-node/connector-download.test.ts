@@ -34,29 +34,42 @@ async function fixture(t: test.TestContext) {
   return { runtime, origin, cookie };
 }
 
-test('production bootstrap offers manual credentials and no connector metadata', async t => {
+test('bootstrap offers manual credentials without an authorization queue or extension and connector metadata', async t => {
   const f = await fixture(t);
   const response = await fetch(f.origin + '/api/bootstrap', { headers: { cookie: f.cookie } });
   assert.equal(response.status, 200);
   const bootstrap = await response.json();
   assert.equal(bootstrap.web.authorization_mode, 'manual'); assert.equal(bootstrap.web.remote_browser, false);
+  assert.equal(bootstrap.authorization, null); assert.equal(bootstrap.web.extension_url, undefined);
   assert.equal(bootstrap.web.connector_url, undefined); assert.equal(bootstrap.web.connector_version, undefined);
   assert.deepEqual(bootstrap.engine.login_methods, ['password', 'session']);
   assert.equal(bootstrap.engine.version, JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
   assert.equal(f.runtime.store.accounts().length, 0); assert.equal(f.runtime.store.runs().length, 0);
 });
 
-test('retired connector download stays unavailable while scoped legacy import remains compatible', async t => {
+test('retired connector downloads stay unavailable and legacy authorization APIs and extension downloads return 410', async t => {
   const f = await fixture(t), route = '/downloads/checkin-assistant-local-connector.zip';
-  const pending = f.runtime.imports.start({ provider: 'anyrouter', method: 'github', interval_hours: 6, origin: f.origin });
-  const callers: Record<string, string>[] = [{}, { cookie: f.cookie }, { authorization: 'Bearer ' + pending.connection!.ticket }];
+  const id = 'a'.repeat(32), ticket = 'A'.repeat(43);
+  const callers: Record<string, string>[] = [{}, { cookie: f.cookie },
+    { authorization: `Bearer ${ticket}` }];
   for (const headers of callers) {
     const response = await fetch(f.origin + route, { headers });
     assert.equal(response.status, 404); assert.equal(response.headers.get('content-type')?.includes('application/zip'), false);
     const text = await response.text(); assert.equal(text.includes('historical-connector-source'), false); assert.equal(text.includes('fixture-private'), false);
   }
-  const legacy = await fetch(f.origin + '/api/browser-import/' + pending.id,
-    { headers: { authorization: 'Bearer ' + pending.connection!.ticket } });
-  assert.equal(legacy.status, 200); assert.equal((await legacy.json()).provider.id, 'anyrouter');
+  const retired = ['/api/login/start', `/api/login/${id}`, `/api/login/${id}/import`, `/api/browser-import/${id}`,
+    '/downloads/checkin-assistant-browser-extension.zip'];
+  for (const endpoint of retired) for (const method of ['GET', 'POST', 'HEAD']) for (const caller of callers) {
+    const response = await fetch(f.origin + endpoint, { method,
+      headers: { ...caller, ...(caller.authorization ? { origin: `chrome-extension://${'a'.repeat(32)}` } : {}),
+        ...(method === 'POST' ? { 'content-type': 'application/json' } : {}) },
+      ...(method === 'POST' ? { body: JSON.stringify({ provider: 'anyrouter', method: 'manual', name: '退役接口测试',
+        interval_hours: 6, session: 'format-valid-retired-session', api_user: '7' }) } : {}) });
+    assert.equal(response.status, 410, `${method} ${endpoint} remains retired regardless of cookies or a legacy Bearer`);
+    assert.equal(response.headers.get('content-type')?.includes('application/zip'), false);
+    const text = await response.text(); assert.equal(text.includes(ticket), false);
+    assert.equal(text.includes('historical-connector-source'), false); assert.equal(text.includes('fixture-private'), false);
+  }
+  assert.equal(Number(f.runtime.store.db.prepare('SELECT COUNT(*) AS count FROM browser_imports').get()!.count), 0);
   assert.equal(f.runtime.store.accounts().length, 0); assert.equal(f.runtime.store.runs().length, 0);
 });

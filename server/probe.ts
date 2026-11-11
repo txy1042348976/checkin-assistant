@@ -1,6 +1,6 @@
 /** Read-only gateway detection, independent of any account or chosen protocol. */
-import { chromium } from 'playwright-core';
 import type { Browser } from 'playwright-core';
+import type { BrowserResources } from './browser-resources.js';
 import { loadConfig } from './config.js';
 import { browserAvailable } from './engine.js';
 import { isRecord } from './errors.js';
@@ -48,17 +48,37 @@ export function chooseProbeResult(results: (ProbeResult | null | undefined)[]): 
 }
 
 let probeBusy = false;
-async function browserConfig(domain: string, config: AppConfig): Promise<(ProbeResult | null)[]> {
+async function browserConfig(domain: string, config: AppConfig, options: ProbeOptions): Promise<(ProbeResult | null)[]> {
   if (probeBusy || !config.browserPath) return [];
   probeBusy = true;
-  let browser: Browser | undefined, closing: Promise<void> | undefined, stopped = false;
+  const controller = new AbortController();
+  const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+  let browser: Browser | undefined, closing: Promise<void> | undefined, stopped = false, release: (() => void) | undefined;
+  const releaseBrowser = () => { release?.(); release = undefined; };
+  const closeBrowser = async (current: Browser): Promise<void> => {
+    try { await current.close(); releaseBrowser(); }
+    catch {
+      if (!current.isConnected()) releaseBrowser();
+      else {
+        current.once('disconnected', releaseBrowser);
+        if (!current.isConnected()) { current.off('disconnected', releaseBrowser); releaseBrowser(); }
+      }
+    }
+  };
   const stop = (): Promise<void> => {
-    stopped = true;
-    if (!closing && browser) closing = browser.close().catch(() => {});
+    stopped = true; controller.abort();
+    if (!closing && browser) closing = closeBrowser(browser);
     return closing ?? Promise.resolve();
   };
+  const cancelled = () => { void stop(); };
+  signal.addEventListener('abort', cancelled, { once: true });
   const timer = setTimeout(() => { void stop(); }, 20000); timer.unref();
   try {
+    if (signal.aborted) return [];
+    if (config.lowMemory && options.browserResources) release = await options.browserResources.acquire(signal);
+    if (signal.aborted) return [];
+    const { chromium } = await import('playwright-core');
+    if (signal.aborted) return [];
     browser = await chromium.launch({ headless: true, executablePath: config.browserPath, timeout: 12_000,
       args: ['--no-proxy-server', ...(config.browserNoSandbox ? ['--no-sandbox'] : [])] });
     if (stopped) { await stop(); return []; }
@@ -128,22 +148,29 @@ async function browserConfig(domain: string, config: AppConfig): Promise<(ProbeR
     if (stopped || !data) return [];
     return PUBLIC_PATHS.map((path, index) => classifyConfig(domain, path, data.responses[index], data.legacy));
   } catch { return []; }
-  finally { clearTimeout(timer); await stop(); probeBusy = false; }
+  finally {
+    clearTimeout(timer); signal.removeEventListener('abort', cancelled);
+    await stop();
+    if (!browser) releaseBrowser();
+    probeBusy = false;
+  }
 }
 
-export async function probeSite(domainInput: string, configInput?: AppConfig): Promise<ProbeResult> {
+export interface ProbeOptions { signal?: AbortSignal; browserResources?: BrowserResources }
+export async function probeSite(domainInput: string, configInput?: AppConfig, options: ProbeOptions = {}): Promise<ProbeResult> {
   const domain = normalizeProviderDomain(domainInput), config = configInput ?? loadConfig();
-  const signal = AbortSignal.timeout(8000);
+  const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000);
   const direct = await Promise.all(PUBLIC_PATHS.map(async path => {
     try {
       const response = await httpRequest(domain + path, { method: 'GET', proxy: { mode: 'direct' }, signal, timeoutMs: 6000, maxBytes: 262144 });
       return response.status === 200 ? classifyConfig(domain, path, response.body) : null;
     } catch { return null; }
   }));
+  if (options.signal?.aborted) return { ...UNKNOWN };
   const result = chooseProbeResult(direct);
   if (result && (!result.recognized || result.protocol === 'sub2api' || result.checkin_enabled !== null || result.template === 'sign_in')) return result;
   if (browserAvailable(config)) {
-    const detected = chooseProbeResult(await browserConfig(domain, config));
+    const detected = chooseProbeResult(await browserConfig(domain, config, options));
     if (detected) return detected;
   }
   return result ?? { ...UNKNOWN };

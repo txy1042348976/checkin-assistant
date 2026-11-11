@@ -44,9 +44,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, overrides: Part
     adminPassword: env.CHECKIN_ADMIN_PASSWORD || undefined,
     browserPath: detectBrowser(env),
     browserNoSandbox: ['1', 'true', 'yes'].includes((env.CHECKIN_BROWSER_NO_SANDBOX || '').toLowerCase()),
+    lowMemory: ['1', 'true', 'yes'].includes((env.CHECKIN_LOW_MEMORY || '').toLowerCase()),
     defaultProxyUrl: env.CHECKIN_PROXY_URL || undefined,
     schedulerTickMs: 15_000,
-    version: '1.0.8',
+    version: '1.0.9',
     testMode: false,
   };
   return { ...config, ...overrides };

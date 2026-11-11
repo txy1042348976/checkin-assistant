@@ -20,7 +20,7 @@ function sitesView(){
     </article>`;
   };
   return `<section class="site-section" aria-labelledby="builtin-sites-title"><div class="panel-head"><div><h2 class="panel-title" id="builtin-sites-title">内置站点</h2><p class="panel-sub">常用站点，添加账号即可使用</p></div><span class="site-section-count">${builtin.length} 个</span></div><div class="site-grid">${builtin.map(card).join('')}</div></section>
-    <section class="site-section" aria-labelledby="custom-sites-title"><div class="panel-head"><div><h2 class="panel-title" id="custom-sites-title">自定义站点</h2><p class="panel-sub">配置一次，关联多个独立账号</p></div>${custom.length?`<button class="button secondary small" data-action="add-site">${icon('plus')}添加自定义站点</button>`:`<span class="site-section-count">0 个</span>`}</div>${custom.length?`<div class="site-grid">${custom.map(card).join('')}</div>`:`<div class="site-empty"><span class="empty-illustration" aria-hidden="true">${icon('layers')}</span><h3>添加你常用的站点</h3><p>填写网站地址，选择签到模式，再连接账号。<br>支持兼容 New API 与 Sub2API 的站点。</p><button class="button primary" data-action="add-site">${icon('plus')}添加自定义站点</button></div>`}</section>
+    <section class="site-section" aria-labelledby="custom-sites-title"><div class="panel-head"><div><h2 class="panel-title" id="custom-sites-title">自定义站点</h2><p class="panel-sub">配置一次，关联多个独立账号</p></div>${custom.length?`<button class="button secondary small" data-action="add-site">${icon('plus')}添加自定义站点</button>`:`<span class="site-section-count">0 个</span>`}</div>${custom.length?`<div class="site-grid">${custom.map(card).join('')}</div>`:`<div class="site-empty"><span class="empty-illustration" aria-hidden="true">${icon('layers')}</span><h3>添加你常用的站点</h3><p>填写网站地址，选择签到模式，再手动添加账号。<br>支持兼容 New API 与 Sub2API 的站点。</p><button class="button primary" data-action="add-site">${icon('plus')}添加自定义站点</button></div>`}</section>
     <div class="notice">${icon('info')}兼容模板支持标准登录、签到与余额查询。转盘或任务奖励等功能需要站点专用适配。</div>`;
 }
 
@@ -30,7 +30,7 @@ function providerModal(site=null){
   modal(`<div class="modal-head"><div><h2>${site?'编辑站点配置':'添加自定义站点'}</h2><p>填写网址后自动识别签到模式，也可手动调整。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><form id="provider-form" data-id="${esc(site?.id||'')}" novalidate>
     <div class="form-errors-summary" role="alert" hidden></div>
     <div class="field"><label for="site-name">站点名称</label><input id="site-name" name="name" required maxlength="40" value="${esc(p.name)}" placeholder="例如：我的 API 站点"></div>
-    <div class="field"><label for="site-domain">站点网址</label><input id="site-domain" name="domain" type="url" required maxlength="250" value="${esc(p.domain)}" placeholder="https://api.example.com" aria-describedby="site-domain-help" data-help-id="site-domain-help" ${p.account_count?'readonly':''}><p class="field-help" id="site-domain-help">${p.account_count?'已关联账号，网址不可修改。更换网站请新增站点并重新授权。':'填写 HTTPS 根网址，系统会自动识别签到模式。'}</p></div>
+    <div class="field"><label for="site-domain">站点网址</label><input id="site-domain" name="domain" type="url" required maxlength="250" value="${esc(p.domain)}" placeholder="https://api.example.com" aria-describedby="site-domain-help" data-help-id="site-domain-help" ${p.account_count?'readonly':''}><p class="field-help" id="site-domain-help">${p.account_count?'已关联账号，网址不可修改。更换网站请新增站点并手动添加账号。':'填写 HTTPS 根网址，系统会自动识别签到模式。'}</p></div>
     <div class="field"><label for="site-template">签到模式</label><select id="site-template" name="template" aria-describedby="site-mode-help" data-help-id="site-mode-help">${Object.entries(siteTemplates).map(([value,label])=>`<option value="${value}" ${visibleSiteMode(p.template)===value?'selected':''}>${label}</option>`).join('')}</select><p class="field-help" id="site-mode-help"></p></div>
     <details class="site-advanced"><summary>高级配置 <span>接口路径、额度单位与换算</span></summary><div class="site-advanced-body">
       <div class="field"><label for="site-login">登录页面路径</label><input id="site-login" name="login_path" required maxlength="200" value="${esc(p.login_path)}"></div>
@@ -42,7 +42,7 @@ function providerModal(site=null){
       <p class="field-help" id="site-quota-help">${p.units_locked?'已有账号或历史记录，额度单位与换算已锁定。':'显示额度 = quota ÷ 换算值。New API 通常为 500000；积分原值可填 1。不同站点积分不合并。'}</p>
     </div></details>
     <div class="site-probe"><div class="site-probe-heading"><b>自动识别</b><button type="button" class="button secondary small" data-action="probe-site">${icon('refresh')}重新检测</button></div><p class="field-help">读取网站公开信息匹配模式，无需账号密码；识别不成功时可手动选择。</p><p id="site-probe-result" role="status">${site?'现有配置已保留，可重新检测获取建议。':'填写完整网址后开始识别。'}</p><button type="button" id="site-apply-probe" class="panel-link" data-action="apply-site-probe" hidden>应用识别结果</button></div>
-    <div class="notice">${icon('shield')}此处只保存站点配置。账号与登录凭据在「添加账号」中单独授权、加密保存。</div>
+    <div class="notice">${icon('shield')}此处只保存站点配置。请在「添加账号」中手动填写登录凭据，凭据将加密保存。</div>
     <div class="modal-actions"><button type="button" class="button secondary" data-action="close">取消</button><button type="submit" class="button primary">${site?'保存配置':'保存站点'}</button></div>
   </form>`);
   const form=$('#provider-form');
@@ -204,7 +204,7 @@ async function saveProvider(form){
     if(!validateProviderForm(form))return;
     await api(id?`/api/providers/${encodeURIComponent(id)}`:'/api/providers',{method:id?'PUT':'POST',body:sitePayload(form)});
     if(!probe?.disposed&&$('#provider-form')===form){closeModal();state.view='sites';}
-    await refresh(true);toast(id?'站点配置已保存':'站点已添加，可以连接账号了');
+    await refresh(true);toast(id?'站点配置已保存':'站点已添加，可以手动添加账号了');
   }catch(error){const summary=$('.form-errors-summary',form);summary.hidden=false;summary.textContent=error.message;}
   finally{submit.disabled=false;submit.textContent=form.dataset.id?'保存配置':'保存站点';}
 }

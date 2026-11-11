@@ -1,10 +1,10 @@
 # 在 1Panel 部署签到助手
 
-本指南适用于签到助手 **v1.0.8**。应用使用 Node.js 24 + TypeScript，一个 Docker Compose 服务包含应用与系统无头 Chromium。网页负责账号管理，服务器负责凭据校验、余额查询和后台任务。
+本指南适用于签到助手 **v1.0.9**。应用使用 Node.js 24 + TypeScript，一个 Docker Compose 服务包含应用与系统无头 Chromium。网页负责手动保存和管理账号，服务器在任务运行时核对身份、查询余额并执行签到。
 
 ## 1. 准备目录与配置
 
-建议使用 2 核 / 4 GB 内存的 Linux 服务器，在 1Panel 安装 Docker 和 OpenResty。首次构建需要访问 Debian 与 npm 软件源。
+在 Linux 服务器上安装 Docker；使用 1Panel 管理时还需配置 OpenResty。**1 核 / 1 GB 主机可从少量账号、单任务的低内存配置开始**，并在宿主机配置至少 2 GiB 总 Swap。1Panel、OpenResty 和其他服务也会占用内存；账号多、频繁使用浏览器或同时运行其他服务时，使用 2 核 / 4 GB 及以上配置更合适。首次构建需要访问 Debian 与 npm 软件源，也会比稳定运行占用更多资源。
 
 下载本仓库源码，或解压 `checkin-assistant-1panel.zip` / `.tar.gz` 到 `/opt/checkin-assistant`。该目录应包含 `Dockerfile`、`docker-compose.yml`、`package.json`、锁文件、`tsconfig.json`、`server/`、`web/`、`deploy/`、`browser-extension/` 和许可文件。
 
@@ -18,10 +18,18 @@ CHECKIN_BIND_IP=127.0.0.1
 CHECKIN_PORT=8765
 CHECKIN_TIMEZONE=Asia/Shanghai
 CHECKIN_MAX_CONCURRENT_RUNS=1
-CHECKIN_MEMORY_LIMIT=2g
+CHECKIN_LOW_MEMORY=1
+CHECKIN_MEMORY_LIMIT=640m
+CHECKIN_MEMORY_SWAP_LIMIT=1280m
 ```
 
 `CHECKIN_PUBLIC_URL` 必须是实际访问的完整根网址，只包含协议、域名及可选端口，不带路径。应用按根路径部署，例如 `https://checkin.example.com/`。默认绑定 `127.0.0.1`，适合在同一服务器上设置反向代理。
+
+上述示例是 1 GB 主机的起始配置。`CHECKIN_MEMORY_LIMIT=640m` 限制容器的物理内存使用；`CHECKIN_MEMORY_SWAP_LIMIT=1280m` 限制容器的**内存与 Swap 合计**，约允许额外使用 640 MiB Swap，并非再增加 1280 MiB Swap。先在宿主机运行 `free -h`，确认 Swap 总量至少 2 GiB；已有足够 Swap 时无需重复添加，配置应在服务器重启后继续生效。Docker 的上限只允许使用已有 Swap，不会创建 Swap 文件。
+
+低内存模式统一限制同时使用的浏览器，任务结束后释放浏览器；普通 AgentRouter Session 余额同步先尝试 HTTP，遇站点防护再启用浏览器。并发保持为 1。Swap 用来缓解内存峰值，持续换页仍会拖慢网站与任务，不能据此保证所有站点都能流畅运行。若首次构建在小主机上内存不足，可在相同 CPU 架构的另一台机器构建镜像，再通过 `docker save` / `docker load` 迁移。
+
+内存更充裕的主机可设置 `CHECKIN_LOW_MEMORY=0`、`CHECKIN_MEMORY_LIMIT=2g`、`CHECKIN_MEMORY_SWAP_LIMIT=0`，使用通用 Compose 默认配置。Swap 上限为 `0` 表示采用 Docker 默认行为，不表示禁用 Swap。`shm_size: 512mb` 是共享内存容量上限，实际使用的内存仍计入容器限制。
 
 ## 2. 创建编排
 
@@ -56,6 +64,8 @@ proxy_buffering off;
 
 修改现有代理 location 中的对应指令，避免重复配置。项目也提供 `deploy/nginx-location.conf`。`client_max_body_size 10m` 为最大 8 MiB 的账号导入文件及请求包装预留空间，接口响应不应缓存。
 
+项目模板对 CSS、JavaScript 和 SVG 使用一级 gzip 压缩，减少静态文件传输量，并控制压缩的 CPU 开销。
+
 OpenResty 若运行在隔离的 Docker bridge 网络中，其中的 `127.0.0.1` 指 OpenResty 容器。可把两个服务接入同一个 Docker 网络，以上游 `http://checkin-assistant:8765` 访问；按面板中实际网络名称配置 Compose 的 external network。
 
 更改域名或协议后，同步更新 `.env` 的 `CHECKIN_PUBLIC_URL`，执行 `docker compose up -d` 更新容器配置。
@@ -78,17 +88,17 @@ OpenResty 若运行在隔离的 Docker bridge 网络中，其中的 `127.0.0.1` 
 | Sub2API | 本站登录 Token 与用户 ID，可选本站刷新 Token |
 | 自定义站点 | 按所选 New API / Sub2API / 余额模板填写 |
 
-在自己的浏览器登录原站，用开发者工具复制本站 `session` Cookie 及 Local Storage 中 `user.id`；Sub2API 通常使用 `auth_token` 与 `user.id`。网页的「打开原站」在独立页面打开登录页，完成后手工填写凭据。
+在自己的浏览器登录原站，用开发者工具复制本站 `session` Cookie 及 Local Storage 中 `user.id`；Sub2API 通常使用 `auth_token` 与 `user.id`。完成后在账号表单手工填写凭据。
 
-Session 方式保存前只读核对身份与余额，不执行登录或签到。账号密码方式先加密保存，在任务运行时验证登录。通过第三方登录注册、尚无站内密码的账号，可使用 Session，或先在原站设置密码。
+Session、登录 Token 和账号密码均先检查字段格式与完整性，再加密保存。保存时不连接原站，新账号余额显示为待同步；首次手动运行或后台定时任务执行时，才核对登录状态并更新余额。表面格式正确但失效的凭据也会先保存，之后根据运行日志重新填写。通过第三方登录注册、尚无站内密码的账号，可使用 Session，或先在原站设置密码。
 
-AgentRouter 的 Session 方式只同步余额；账号密码方式只有当次登录响应明确确认签到时才记为签到成功。余额同步和奖励未知不会显示为已领取奖励。服务器出口、站点防护与人工验证码可能影响校验和后续任务，具体原因在运行日志中查看。
+AgentRouter 的 Session 方式只同步余额；账号密码方式只有当次登录响应明确确认签到时才记为签到成功。余额同步和奖励未知不会显示为已领取奖励。服务器出口、站点防护与人工验证码可能影响任务，具体原因在运行日志中查看。
 
 每个账号可设置执行间隔与代理。服务器任务使用服务器网络；容器内的 `127.0.0.1` 指容器本身，宿主机代理可使用 `host.docker.internal:端口`，并允许容器访问。
 
 ## 6. 导入、导出与备份
 
-账号页可导出全部账号或当前筛选结果，默认下载密码加密的 JSON，也支持普通 JSON。导入先预览，再确认保存，单文件最多 500 个账号、8 MiB。已有账号不被覆盖，新账号默认暂停自动运行，可选择恢复文件里的启用状态。
+账号页可导出全部账号或当前筛选结果，默认下载密码加密的 JSON，也支持普通 JSON。导入先预览，再确认保存，单文件最多 500 个账号、8 MiB。已有账号不被覆盖，新账号默认暂停自动运行，可选择恢复文件里的启用状态。导入文件不请求原站，首次任务运行时才核对凭据并更新余额。
 
 账号文件包含站点凭据与配置，跨安装导入时用目标安装的密钥重新加密；它不包含管理员、余额、运行历史和原安装密钥。迁移完整安装时，应备份整个 `data/` 目录，其中包括 `checkin-assistant.db` 与 `secret.key`。
 
@@ -105,7 +115,7 @@ docker compose up -d
 
 ## 配置参考
 
-| 变量 | 默认值 | 用途 |
+| 变量 | 未配置时的默认值 | 用途 |
 |---|---|---|
 | `CHECKIN_PUBLIC_URL` | 空 | 浏览器实际访问的根网址 |
 | `CHECKIN_ADMIN_USER` | 空 | 可选首次预设账号；仅有预设密码时回退为 `admin` |
@@ -115,7 +125,9 @@ docker compose up -d
 | `CHECKIN_DATA_DIR` | `data/` | 直接运行的数据目录；Compose 中固定为 `/data` |
 | `CHECKIN_TIMEZONE` | `Asia/Shanghai` | 任务与记录时区 |
 | `CHECKIN_MAX_CONCURRENT_RUNS` | `1` | 同时运行的任务数 |
+| `CHECKIN_LOW_MEMORY` | `0` | `1` 开启低内存模式；1 GB 主机保持任务并发为 1 |
 | `CHECKIN_MEMORY_LIMIT` | `2g` | Compose 的内存上限 |
+| `CHECKIN_MEMORY_SWAP_LIMIT` | `0` | Compose 的内存与 Swap 合计上限；1 GB 示例为 `1280m`，需宿主机先提供 Swap |
 | `CHECKIN_PROXY_URL` | 空 | AgentRouter 默认服务器代理；独立账号配置优先 |
 | `CHECKIN_SESSION_HOURS` | `24` | 管理员登录会话有效时间，直接运行时可配置 |
 | `CHECKIN_BROWSER_PATH` | 自动检测 | 直接运行时的 Chrome / Chromium 路径 |
@@ -126,6 +138,8 @@ docker compose up -d
 docker compose ps
 docker compose logs --tail 100 checkin-assistant
 curl http://127.0.0.1:8765/api/health
+free -h
+docker compose stats --no-stream
 ```
 
 应用和 Chromium 在容器中以非 root 用户运行。健康检查由 Node.js 执行；网页需要重新登录时，使用已保存的管理员账号与密码。

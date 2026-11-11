@@ -152,6 +152,7 @@ export interface AppConfig {
   adminPassword?: string;
   browserPath?: string;
   browserNoSandbox: boolean;
+  lowMemory: boolean;
   defaultProxyUrl?: string;
   schedulerTickMs: number;
   version: string;

@@ -22,11 +22,13 @@ services:
       CHECKIN_ADMIN_PASSWORD: "${CHECKIN_ADMIN_PASSWORD:-}"
       CHECKIN_PUBLIC_URL: "${CHECKIN_PUBLIC_URL:-}"
       CHECKIN_MAX_CONCURRENT_RUNS: "${CHECKIN_MAX_CONCURRENT_RUNS:-1}"
+      CHECKIN_LOW_MEMORY: "${CHECKIN_LOW_MEMORY:-0}"
       CHECKIN_PROXY_URL: "${CHECKIN_PROXY_URL:-}"
     volumes:
       - ./data:/data
     shm_size: 512mb
     mem_limit: "${CHECKIN_MEMORY_LIMIT:-2g}"
+    memswap_limit: "${CHECKIN_MEMORY_SWAP_LIMIT:-0}"
     security_opt:
       - no-new-privileges:true
     extra_hosts:

@@ -225,6 +225,10 @@ export class Store {
       if (!columns.some(column => column.name === 'login_via')) this.db.exec('ALTER TABLE accounts ADD COLUMN login_via TEXT');
       const runColumns = this.db.prepare('PRAGMA table_info(runs)').all();
       if (!runColumns.some(column => column.name === 'currency')) this.db.exec("ALTER TABLE runs ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'");
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS runs_started_at_jd ON runs(julianday(started_at));
+        CREATE INDEX IF NOT EXISTS runs_provider ON runs(provider);
+      `);
       this.db.prepare("UPDATE accounts SET status='idle',last_message=? WHERE status='vip_required'")
         .run('已恢复普通签到，等待下一次执行。');
       this.db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)')
@@ -427,8 +431,13 @@ export class Store {
 
   private localDate(value: string | Date): string {
     const parts = this.dateFormatter.formatToParts(typeof value === 'string' ? new Date(value) : value);
-    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-    return values.year + '-' + values.month + '-' + values.day;
+    let year = '', month = '', day = '';
+    for (const part of parts) {
+      if (part.type === 'year') year = part.value;
+      else if (part.type === 'month') month = part.value;
+      else if (part.type === 'day') day = part.value;
+    }
+    return year + '-' + month + '-' + day;
   }
 
   dashboard(): Dashboard {
@@ -436,36 +445,66 @@ export class Store {
     const runs = this.runs();
     const now = new Date();
     const today = this.localDate(now);
-    const history = this.db.prepare('SELECT * FROM runs WHERE julianday(started_at)>=julianday(?) ORDER BY id DESC')
-      .all(iso(new Date(now.getTime() - 8 * DAY_MS))).map(row => ({ ...row }) as unknown as RunRow);
-    const dated = history.map(row => ({ row, day: this.localDate(row.started_at) }));
-    const todayRuns = dated.filter(item => item.day === today).map(item => item.row);
     const days = Array.from({ length: 7 }, (_, index) => {
       const day = new Date(today + 'T00:00:00Z');
       day.setUTCDate(day.getUTCDate() - 6 + index);
       return day.toISOString().slice(0, 10);
     });
-    const currencies = [...new Set(['USD', ...accounts.map(group), ...runs.map(group), ...history.map(group)])].sort();
+    const calendar = new Set(days), currencies = new Set(['USD', ...runs.map(group)]);
+    const balances = new Map<string, number>();
+    for (const account of accounts) {
+      const currency = group(account);
+      currencies.add(currency);
+      if (account.balance === null) continue;
+      balances.set(currency, (balances.get(currency) ?? 0) + account.balance);
+    }
+    const daily = new Map<string, Map<string, { reward: number; runs: number }>>();
+    const totals = new Map<string, { reward: number; runs: number }>();
+    const localDates = new Map<string, string>(), completed = new Set<number>();
+    // Offset timestamps remain comparable through julianday. Force the range
+    // index instead of a full id scan, then retain descending-id sum order.
+    const history = this.db.prepare(`
+      SELECT account_id,provider,status,started_at,reward,currency FROM runs INDEXED BY runs_started_at_jd
+      WHERE julianday(started_at)>=julianday(?) ORDER BY id DESC
+    `).iterate(iso(new Date(now.getTime() - 8 * DAY_MS)));
+    for (const raw of history) {
+      const row = raw as unknown as Pick<RunRow, 'account_id' | 'provider' | 'status' | 'started_at' | 'reward' | 'currency'>;
+      const currency = group(row);
+      currencies.add(currency);
+      let day = localDates.get(row.started_at);
+      if (day === undefined) { day = this.localDate(row.started_at); localDates.set(row.started_at, day); }
+      if (!calendar.has(day)) continue;
+      let bucket = daily.get(currency);
+      if (!bucket) { bucket = new Map(); daily.set(currency, bucket); }
+      let point = bucket.get(day);
+      if (!point) { point = { reward: 0, runs: 0 }; bucket.set(day, point); }
+      point.reward += row.reward ?? 0;
+      point.runs++;
+      let total = totals.get(day);
+      if (!total) { total = { reward: 0, runs: 0 }; totals.set(day, total); }
+      total.reward += row.currency === 'USD' ? row.reward ?? 0 : 0;
+      total.runs++;
+      if (day === today && row.account_id !== null && ['success', 'already_checked', 'synced'].includes(row.status)) completed.add(row.account_id);
+    }
     const amounts: Dashboard['amounts'] = {};
     const trends: Dashboard['trends'] = {};
-    for (const currency of currencies) {
-      const balances = accounts.filter(row => row.balance !== null && group(row) === currency).map(row => row.balance!);
-      amounts[currency] = { balance: balances.length ? roundMoney(balances.reduce((sum, amount) => sum + amount, 0)) : null,
-        today_reward: roundMoney(todayRuns.filter(row => group(row) === currency).reduce((sum, row) => sum + (row.reward ?? 0), 0)) };
+    for (const currency of [...currencies].sort()) {
+      const balance = balances.get(currency), bucket = daily.get(currency);
+      amounts[currency] = { balance: balance === undefined ? null : roundMoney(balance),
+        today_reward: roundMoney(bucket?.get(today)?.reward ?? 0) };
       trends[currency] = days.map(day => {
-        const entries = dated.filter(item => item.day === day && group(item.row) === currency);
-        return { date: day.slice(5), reward: roundMoney(entries.reduce((sum, item) => sum + (item.row.reward ?? 0), 0)), runs: entries.length };
+        const point = bucket?.get(day);
+        return { date: day.slice(5), reward: roundMoney(point?.reward ?? 0), runs: point?.runs ?? 0 };
       });
     }
-    const known = accounts.filter(row => row.balance !== null && row.currency === 'USD').map(row => row.balance!);
     return { accounts, runs, settings: this.settings(), amounts, trends,
-      stats: { balance: known.length ? roundMoney(known.reduce((sum, balance) => sum + balance, 0)) : null,
+      stats: { balance: amounts.USD.balance,
         today_reward: amounts.USD.today_reward,
-        today_completed: new Set(todayRuns.filter(row => row.account_id !== null && ['success', 'already_checked', 'synced'].includes(row.status)).map(row => row.account_id)).size,
+        today_completed: completed.size,
         total_accounts: accounts.length },
       trend: days.map(day => {
-        const entries = dated.filter(item => item.day === day);
-        return { date: day.slice(5), reward: roundMoney(entries.reduce((sum, item) => sum + (item.row.currency === 'USD' ? item.row.reward ?? 0 : 0), 0)), runs: entries.length };
+        const point = totals.get(day);
+        return { date: day.slice(5), reward: roundMoney(point?.reward ?? 0), runs: point?.runs ?? 0 };
       }) };
   }
 }

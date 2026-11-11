@@ -4,17 +4,15 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = v => String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon = (name, cls='') => `<img class="icon ${esc(cls)}" src="/assets/icons/${encodeURIComponent(name)}.svg" alt="" aria-hidden="true" width="19" height="19">`;
 const labels={not_run:'未执行',idle:'待运行',running:'执行中',queued:'排队中',success:'签到成功',already_checked:'今日已签到',synced:'余额已同步',manual_required:'需要处理',failed:'执行失败',interrupted:'已中断'};
-const state={data:null,auth:null,currency:'USD',view:'overview',filter:'all',query:'',logFilter:'all',editing:null,busy:false,loginMethod:'session',loginSession:null,reauth:false,connecting:null,targetProvider:null,selectedProviders:[],loginQueue:null,refreshing:false,authorizationChecked:false};
+const state={data:null,auth:null,currency:'USD',view:'overview',filter:'all',query:'',logFilter:'all',editing:null,busy:false,loginMethod:'session',reauth:false,targetProvider:null,selectedProviders:[],refreshing:false};
 const allProviders=()=>state.data?.providers||[];
 const providers=()=>allProviders().filter(p=>p.active!==false);
 const providerName=id=>esc(allProviders().find(p=>p.id===id)?.name||id||'未知平台');
-const isOAuth=method=>['github','linuxdo'].includes(method);
-const isBrowser=method=>isOAuth(method)||method==='manual';
-const userBrowserAuthorization=()=>['manual','user_browser'].includes(state.data?.web?.authorization_mode);
 const currencyLabel=unit=>unit?.startsWith('credits:')?`${providerName(unit.slice(8))} · 积分`:({USD:'USD',CNY:'CNY',credits:'积分'}[unit]||'USD');
 const money=(n,unit='USD')=>n==null?'<span class="unknown-money">待同步</span>':`${unit==='CNY'?'¥':unit.startsWith('credits')?'':'$'}${Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}${unit.startsWith('credits')?' 积分':''}`;
 const authLabel=a=>(a.auth_mode==='password'?'账号密码':a.login_via==='github'?'GitHub 授权':a.login_via==='linuxdo'?'LinuxDO 授权':a.login_via==='manual'?'手填 Session':'Session')+`<small class="account-proxy">${a.proxy?.mode==='custom'?'自定义代理':a.proxy?.mode==='direct'?'直连':'默认网络'}</small>`;
-let toastTimer,loginPoll,refreshTimer,modalTrigger;
+let toastTimer,refreshTimer,clockTimer,modalTrigger;
+let refreshRequest=null,refreshQueued=false,refreshFeedback=false,refreshEpoch=0,refreshFailures=0,refreshFingerprint=null;
 const credentialRequests=new WeakMap();
 const ACCOUNT_BACKUP_MAX_BYTES=8*1024*1024;
 let accountFileTransfer=null;
@@ -23,22 +21,72 @@ function connectionStatus(online){const el=$('#connection'),value=online?'online
 async function api(path,options={}){
  const method=options.method||'GET';
  const csrf=state.data?.csrf_token||state.auth?.csrf_token;
+ const epoch=refreshEpoch;
  const response=await fetch(path,{method,headers:method==='GET'?{}:{'Content-Type':'application/json',...(csrf?{'X-CSRF-Token':csrf}:{})},body:options.body?JSON.stringify(options.body):undefined,signal:options.signal,credentials:'same-origin',cache:'no-store'});
- if(!response.ok){let message='请求未完成';try{const body=await response.json();message=typeof body.detail==='string'?body.detail:'请检查填写内容';}catch{}const error=new Error(message);error.status=response.status;error.definitive=response.status>=400&&response.status<500;if(response.status===401&&!path.startsWith('/api/auth/')){await returnToLogin();}throw error;}
+ if(!response.ok){let message='请求未完成';try{const body=await response.json();message=typeof body.detail==='string'?body.detail:'请检查填写内容';}catch{}const error=new Error(message);error.status=response.status;error.definitive=response.status>=400&&response.status<500;if(response.status===401&&!path.startsWith('/api/auth/')&&epoch===refreshEpoch){await returnToLogin();}throw error;}
  return response.json();
 }
-async function refresh(silent=false){
- if(state.refreshing||state.auth?.authenticated===false)return;
- state.refreshing=true;
- try{state.data=await api('/api/bootstrap');connectionStatus(true);render();syncAccountTransfer(accountFileTransfer);if(!state.authorizationChecked){state.authorizationChecked=true;restoreAuthorization(state.data.authorization);}}
- catch(error){if(error.status!==401){connectionStatus(false);if(!silent)toast('无法连接服务，请检查网络后重新连接。');}}
- finally{state.refreshing=false;}
+function dashboardFingerprint(data){
+ // These fields drive the workspace. CSRF tokens and authorization elapsed time
+ // still update in state, but do not require rebuilding its unchanged controls.
+ return JSON.stringify([data.accounts,data.runs,data.settings,data.stats,data.amounts,data.trends,data.trend,data.providers,data.web,data.engine]);
+}
+function refreshDelay(){
+ if(refreshFailures)return Math.min(120000,5000*2**Math.min(refreshFailures-1,5));
+ return !state.data||state.data.accounts.some(account=>['queued','running'].includes(account.status))?5000:30000;
+}
+function scheduleRefresh(){
+ clearTimeout(refreshTimer);refreshTimer=null;
+ if(!refreshRequest&&document.visibilityState!=='hidden'&&state.auth?.authenticated!==false)refreshTimer=setTimeout(refreshLoop,refreshDelay());
+}
+function resetRefresh(){
+ refreshEpoch++;refreshQueued=false;refreshFeedback=false;refreshFingerprint=null;refreshFailures=0;
+ const previous=refreshRequest;refreshRequest=null;state.refreshing=false;previous?.controller.abort();
+ clearTimeout(refreshTimer);refreshTimer=null;clearTimeout(clockTimer);clockTimer=null;
+}
+async function refresh(silent=false,{background=false}={}){
+ if(state.auth?.authenticated===false||document.visibilityState==='hidden')return;
+ if(refreshRequest){
+  // Reads from polling share the current request. An action completed after it
+  // started needs one subsequent read, and its caller awaits that read too.
+  if(!background){refreshQueued=true;refreshFeedback=refreshFeedback||!silent;}
+  return refreshRequest.promise;
+ }
+ const request={epoch:refreshEpoch,controller:new AbortController(),promise:null};
+ refreshRequest=request;state.refreshing=true;refreshQueued=false;refreshFeedback=!silent;
+ clearTimeout(refreshTimer);refreshTimer=null;
+ request.promise=(async()=>{
+  do{
+   refreshQueued=false;const feedback=refreshFeedback;refreshFeedback=false;
+   try{
+    const data=await api('/api/bootstrap',{signal:request.controller.signal});
+    if(request.epoch!==refreshEpoch||state.auth?.authenticated===false)return;
+    const fingerprint=dashboardFingerprint(data),changed=fingerprint!==refreshFingerprint;
+    state.data=data;refreshFingerprint=fingerprint;refreshFailures=0;connectionStatus(true);
+    if(changed)render();else updateRunTimes();
+    syncAccountTransfer(accountFileTransfer);scheduleClock();
+   }catch(error){
+    if(request.epoch!==refreshEpoch)return;
+    if(error.status!==401){refreshFailures++;connectionStatus(false);if(feedback)toast('无法连接服务，请检查网络后重新连接。');}
+   }
+  }while(refreshQueued&&request.epoch===refreshEpoch&&state.auth?.authenticated!==false&&document.visibilityState!=='hidden');
+ })().finally(()=>{if(refreshRequest===request){refreshRequest=null;state.refreshing=false;scheduleRefresh();}});
+ return request.promise;
 }
 function timeLabel(value,date=false){
  if(!value)return '尚未执行';const d=new Date(value);if(Number.isNaN(d.getTime()))return '时间未知';const diff=d-Date.now();
  if(!date&&diff>0&&diff<86400000){const h=Math.floor(diff/3600000),m=Math.max(1,Math.floor(diff%3600000/60000));return h?`${h} 小时 ${m} 分后`:`${m} 分钟后`;}
  const options={month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false};if(state.data?.web?.timezone)options.timeZone=state.data.web.timezone;
  try{return d.toLocaleString('zh-CN',options);}catch{delete options.timeZone;return d.toLocaleString('zh-CN',options);}
+}
+function runTimeMarkup(value){return `<span data-run-time="${esc(value)}">${timeLabel(value)}</span>`;}
+function updateRunTimes(){
+ if(!state.data||state.auth?.authenticated===false||document.visibilityState==='hidden')return;
+ $$('[data-run-time]').forEach(element=>{const text=timeLabel(element.dataset.runTime);if(element.textContent!==text)element.textContent=text;});
+}
+function scheduleClock(){
+ clearTimeout(clockTimer);clockTimer=null;
+ if(state.data&&state.auth?.authenticated!==false&&document.visibilityState!=='hidden')clockTimer=setTimeout(()=>{updateRunTimes();scheduleClock();},60000-Date.now()%60000);
 }
 function nextRun(){return state.data.accounts.filter(a=>a.enabled&&a.next_run).sort((a,b)=>a.next_run.localeCompare(b.next_run))[0];}
 function currencyPicker(){
@@ -66,12 +114,12 @@ function chart(){
 function schedule(){
  const s=state.data.settings,n=nextRun(),enabled=state.data.accounts.filter(a=>a.enabled).length;
  return `<section class="panel schedule-panel"><div class="panel-head"><div><h2 class="panel-title">自动运行</h2><p class="panel-sub">按账号间隔执行签到</p></div><button class="icon-button" data-action="settings" title="定时设置" aria-label="定时设置">${icon('settings')}</button></div>
-  <div class="schedule-main"><span class="schedule-status ${s.scheduler_enabled?'':'paused'}"><i></i>${s.scheduler_enabled?'调度已启用':'自动运行已暂停'}</span><div class="schedule-next-label">下一次运行</div><div class="schedule-time">${s.scheduler_enabled&&n?timeLabel(n.next_run):s.scheduler_enabled?'等待添加账号':'暂未安排'}</div><div class="schedule-caption">${s.scheduler_enabled&&n?`${esc(n.name)} · ${providerName(n.provider)}`:'随时可以手动运行签到'}</div>
+  <div class="schedule-main"><span class="schedule-status ${s.scheduler_enabled?'':'paused'}"><i></i>${s.scheduler_enabled?'调度已启用':'自动运行已暂停'}</span><div class="schedule-next-label">下一次运行</div><div class="schedule-time">${s.scheduler_enabled&&n?runTimeMarkup(n.next_run):s.scheduler_enabled?'等待添加账号':'暂未安排'}</div><div class="schedule-caption">${s.scheduler_enabled&&n?`${esc(n.name)} · ${providerName(n.provider)}`:'随时可以手动运行签到'}</div>
   <dl class="schedule-detail"><div><dt>自动运行账号</dt><dd>${enabled}<span> / ${state.data.accounts.length}</span></dd></div><div><dt>默认执行间隔</dt><dd>每 ${s.interval_hours} 小时</dd></div><div><dt>运行时区</dt><dd>${esc(state.data.web?.timezone||'本机时间')}</dd></div></dl></div>
   <div class="switch-row"><div><b>后台定时签到</b><span>关闭网页后继续运行</span></div><button class="switch ${s.scheduler_enabled?'on':''}" data-action="toggle-scheduler" aria-label="切换自动签到" aria-pressed="${s.scheduler_enabled}"></button></div></section>`;
 }
 function statusBadge(status){return `<span class="status-badge ${esc(status)}">${status==='success'||status==='already_checked'?icon('checkplain'):status==='manual_required'||status==='failed'?icon('warning'):''}${labels[status]||esc(status)}</span>`;}
-function accountRows(accounts){if(!accounts.length)return `<tr><td colspan="7" class="empty-row"><div class="empty-state"><div class="empty-illustration">${icon('users')}</div><b>${state.query||state.filter!=='all'?'没有匹配的账号':'把常用站点，连接到这里。'}</b><p>${state.query||state.filter!=='all'?'更换关键词或平台筛选，查看其他账号。':'添加你的第一个账号，让签到、余额与运行记录集中呈现。'}</p>${state.query||state.filter!=='all'?'':`<button class="button primary small" data-action="add">${icon('plus')}添加第一个账号</button>`}</div></td></tr>`;return accounts.map(a=>`<tr><td><div class="account-name"><span class="provider-badge ${a.provider==='anyrouter'?'any':a.provider==='agentrouter'?'agent':'custom'}">${esc((allProviders().find(p=>p.id===a.provider)?.name||a.provider).slice(0,1))}</span><div>${esc(a.name)}<small>${providerName(a.provider)}</small></div></div></td><td>${statusBadge(a.status)}</td><td class="balance">${money(a.balance,a.currency)}</td><td class="hide-mobile">${timeLabel(a.last_run)}</td><td class="hide-medium">${a.enabled?timeLabel(a.next_run):'自动运行已关闭'}</td><td class="hide-medium">${authLabel(a)}</td><td><div class="row-actions"><button class="icon-button" data-action="run" data-id="${a.id}" title="立即运行" aria-label="运行 ${esc(a.name)}" ${['running','queued'].includes(a.status)?'disabled':''}>${['running','queued'].includes(a.status)?'<i class="inline-spinner"></i>':icon('play')}</button>${a.auth_mode==='session'?`<button class="icon-button" data-action="relogin" data-id="${a.id}" title="重新填写凭据" aria-label="重新填写 ${esc(a.name)} 的凭据">${icon('refresh')}</button>`:''}${isOAuth(a.login_via)?`<button class="icon-button hide-mobile" data-action="connect-platform" data-id="${a.id}" title="连接其他平台" aria-label="连接其他平台">${icon('plus')}</button>`:''}<button class="icon-button" data-action="edit" data-id="${a.id}" title="编辑账号" aria-label="编辑 ${esc(a.name)}">${icon('dots')}</button></div></td></tr>`).join('');}
+function accountRows(accounts){if(!accounts.length)return `<tr><td colspan="7" class="empty-row"><div class="empty-state"><div class="empty-illustration">${icon('users')}</div><b>${state.query||state.filter!=='all'?'没有匹配的账号':'把常用站点，连接到这里。'}</b><p>${state.query||state.filter!=='all'?'更换关键词或平台筛选，查看其他账号。':'添加你的第一个账号，让签到、余额与运行记录集中呈现。'}</p>${state.query||state.filter!=='all'?'':`<button class="button primary small" data-action="add">${icon('plus')}添加第一个账号</button>`}</div></td></tr>`;return accounts.map(a=>`<tr><td><div class="account-name"><span class="provider-badge ${a.provider==='anyrouter'?'any':a.provider==='agentrouter'?'agent':'custom'}">${esc((allProviders().find(p=>p.id===a.provider)?.name||a.provider).slice(0,1))}</span><div>${esc(a.name)}<small>${providerName(a.provider)}</small></div></div></td><td>${statusBadge(a.status)}</td><td class="balance">${money(a.balance,a.currency)}</td><td class="hide-mobile">${timeLabel(a.last_run)}</td><td class="hide-medium">${a.enabled?runTimeMarkup(a.next_run):'自动运行已关闭'}</td><td class="hide-medium">${authLabel(a)}</td><td><div class="row-actions"><button class="icon-button" data-action="run" data-id="${a.id}" title="立即运行" aria-label="运行 ${esc(a.name)}" ${['running','queued'].includes(a.status)?'disabled':''}>${['running','queued'].includes(a.status)?'<i class="inline-spinner"></i>':icon('play')}</button>${a.auth_mode==='session'?`<button class="icon-button" data-action="relogin" data-id="${a.id}" title="重新填写凭据" aria-label="重新填写 ${esc(a.name)} 的凭据">${icon('refresh')}</button>`:''}<button class="icon-button" data-action="edit" data-id="${a.id}" title="编辑账号" aria-label="编辑 ${esc(a.name)}">${icon('dots')}</button></div></td></tr>`).join('');}
 function filteredAccounts(){let accounts=state.data.accounts;if(state.filter!=='all')accounts=accounts.filter(a=>a.provider===state.filter);if(state.query)accounts=accounts.filter(a=>a.name.toLowerCase().includes(state.query.toLowerCase()));return accounts;}
 function accountsPanel(overview=false){
  const accounts=overview?state.data.accounts:filteredAccounts(),scrollable=overview&&accounts.length>5;
@@ -146,50 +194,35 @@ function modal(content,{destructive=false}={}){
  if(!dialog.open)dialog.showModal();
  if(destructive)$('[data-action="close"]',dialog)?.focus({preventScroll:true});
 }
-function stopLoginPoll(){clearTimeout(loginPoll);loginPoll=null;}
 function closeModal(){
   disposeAccountTransfer();
   if(typeof cancelSiteProbe==='function')cancelSiteProbe($('#provider-form'));
-  stopLoginPoll();
-  const queue=state.loginQueue;
-  if(queue){
-    queue.stopped=true;
-    queue.connection=null;
-    if(queue.session)void cancelLoginSession(queue,queue.session);
-  }
-  clearBrowserImportFields();
   const accountForm=$('#account-form');if(accountForm){accountForm.reset();credentialRequests.delete(accountForm);}
-  state.loginSession=null;
   $('#modal').close();
   restoreFocus(modalTrigger);
   modalTrigger=null;
   state.editing=null;
-  state.connecting=null;
   state.targetProvider=null;
 }
-function methodName(method){return {github:'GitHub',linuxdo:'LinuxDO',manual:'手动填写',password:'账号密码',session:'Session'}[method]||method;}
 function accountMethod(account){return account.auth_mode==='password'?'password':'session';}
-function eligibleProviders(){return providers().filter(p=>(!state.targetProvider||p.id===state.targetProvider)&&(p.login_methods||[]).includes(state.loginMethod)&&p.id!==state.connecting?.provider);}
-function accountModal(account=null,connecting=null,targetProvider=null){
-  if(state.loginQueue&&!state.loginQueue.stopped&&!state.loginQueue.done)return;
-  state.loginQueue=null;
+function eligibleProviders(){return providers().filter(p=>(!state.targetProvider||p.id===state.targetProvider)&&(p.login_methods||[]).includes(state.loginMethod));}
+function accountModal(account=null,_previousAccount=null,targetProvider=null){
   state.editing=account;
-  state.connecting=connecting;
   state.targetProvider=targetProvider;
   state.reauth=false;
   state.loginMethod=account?accountMethod(account):'session';
   state.selectedProviders=targetProvider?[targetProvider]:[];
-  modal(`<div class="modal-head"><div><h2>${account?'编辑账号':connecting?'连接其他平台':'添加账号'}</h2><p>${account?'凭据已加密保存，留空保留；替换时请填写同一站点账号。':connecting?`为新平台填写自己的凭据，不复制「${esc(connecting.name)}」的 Cookie。`:'选择站点，直接填写自己的账号凭据。'}</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
+  modal(`<div class="modal-head"><div><h2>${account?'编辑账号':'添加账号'}</h2><p>${account?'凭据已加密保存，留空保留；替换时请填写同一站点账号。':'选择站点，填写凭据后直接保存。首次运行时核对登录状态并更新余额。'}</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div>
   <form id="account-form" novalidate>
     <div class="account-form-body">
     <div class="form-errors-summary" role="alert" hidden></div>
-    <div class="form-grid account-basics"><div class="field"><label>账号备注</label><input name="name" required maxlength="40" value="${esc((account||connecting)?.name||'')}" placeholder="例如：我的主账号"></div><div id="platform-picker"></div></div>
+    <div class="form-grid account-basics"><div class="field"><label>账号备注</label><input name="name" required maxlength="40" value="${esc(account?.name||'')}" placeholder="例如：我的主账号"></div><div id="platform-picker"></div></div>
     <div class="field credential-mode-picker"><span class="field-label" id="credential-mode-label">凭据方式</span><div class="segmented" role="group" aria-labelledby="credential-mode-label"><button type="button" data-method="session">Session Cookie</button><button type="button" data-method="password">账号密码</button></div></div>
     <div id="credentials"></div>
     ${account?`<div class="settings-line account-auto-setting"><div><b>此账号自动运行</b><p>暂停后仍可手动签到，已保存的凭据会保留。</p></div><button type="button" class="switch ${account.enabled?'on':''}" data-action="toggle-account-enabled" data-id="${account.id}" aria-label="切换此账号自动运行" aria-pressed="${account.enabled}"></button></div>`:''}
     ${account?`<div class="account-tools"><button type="button" class="button secondary small" data-action="run" data-id="${account.id}">${icon('play')}立即运行</button></div>`:''}
-    <details id="account-advanced" class="account-advanced"><summary>执行间隔与网络代理 <span>默认每 ${((account||connecting)?.interval_hours||6)} 小时</span></summary><div class="account-advanced-content"><div class="field"><label for="account-interval">执行间隔</label><select id="account-interval" name="interval_hours">${Array.from(new Set([1,3,6,12,24,((account||connecting)?.interval_hours||6)])).sort((a,b)=>a-b).map(h=>`<option value="${h}" ${((account||connecting)?.interval_hours||6)===h?'selected':''}>每 ${h} 小时</option>`).join('')}</select></div>${proxyFields(account?.proxy)}</div></details>
-    <div class="credential-security-note">${icon('shield')}凭据加密保存在你部署的服务器。Session 将先核对原站身份。</div>
+    <details id="account-advanced" class="account-advanced"><summary>执行间隔与网络代理 <span>默认每 ${(account?.interval_hours||6)} 小时</span></summary><div class="account-advanced-content"><div class="field"><label for="account-interval">执行间隔</label><select id="account-interval" name="interval_hours">${Array.from(new Set([1,3,6,12,24,(account?.interval_hours||6)])).sort((a,b)=>a-b).map(h=>`<option value="${h}" ${(account?.interval_hours||6)===h?'selected':''}>每 ${h} 小时</option>`).join('')}</select></div>${proxyFields(account?.proxy)}</div></details>
+    <div class="credential-security-note">${icon('shield')}凭据加密保存在你部署的服务器。首次运行时核对登录状态并更新余额。</div>
     </div>
     <div class="modal-actions">${account?`<button type="button" class="button ghost danger push-left" data-action="delete" data-id="${account.id}">删除账号</button>`:''}<button type="button" class="button secondary" data-action="close">取消</button><button class="button primary" type="submit" id="account-submit"></button></div>
   </form>`);
@@ -208,7 +241,7 @@ function proxyFields(proxy={mode:'default'}){
         <div class="field"><label for="proxy-username">代理用户名</label><input id="proxy-username" name="proxy_username" maxlength="300" autocomplete="off"></div>
         <div class="field"><label for="proxy-password">代理密码</label><input id="proxy-password" name="proxy_password" type="password" maxlength="1000" autocomplete="new-password"></div>
       </div>
-      <p class="field-help">此代理用于服务器的凭据校验、账号密码登录、余额查询与签到。切换网络出口后，网站可能要求重新登录。SOCKS5 仅支持无认证连接。</p>
+      <p class="field-help">此代理用于服务器的账号登录、余额查询与签到。切换网络出口后，网站可能要求重新登录。SOCKS5 仅支持无认证连接。</p>
     </div>
   </section>`;
 }
@@ -224,7 +257,7 @@ function syncProxy(){
     const input=$(`[name="proxy_${key}"]`);input.disabled=!authenticated;input.required=authenticated&&!keep;
     input.placeholder=keep?'已加密保存，留空保留':key==='username'?'填写代理用户名':'填写代理密码';
   }
-  $('#proxy-hint').textContent=custom?'认证信息仅在服务端加密保存。':mode.value==='direct'?'此账号的后台校验、登录与签到直接连接网站。':'沿用平台原有网络设置；未配置环境代理时直接连接。';
+  $('#proxy-hint').textContent=custom?'认证信息仅在服务端加密保存。':mode.value==='direct'?'此账号的后台登录、余额查询与签到直接连接网站。':'沿用平台原有网络设置；未配置环境代理时直接连接。';
 }
 function proxyPayload(form){
   const data=Object.fromEntries(new FormData(form));
@@ -246,7 +279,7 @@ function platformPicker(){
   }else{
     const valid=state.selectedProviders.filter(id=>eligible.some(p=>p.id===id));
     state.selectedProviders=valid.length?valid:[eligible.find(p=>p.id==='anyrouter')?.id||eligible[0]?.id].filter(Boolean);
-    if(!isOAuth(state.loginMethod))state.selectedProviders=state.selectedProviders.slice(0,1);
+    state.selectedProviders=state.selectedProviders.slice(0,1);
     target.innerHTML=`<div class="field"><label for="account-provider">所属站点</label><select id="account-provider" name="provider">${eligible.map(p=>`<option value="${esc(p.id)}" ${state.selectedProviders.includes(p.id)?'selected':''}>${esc(p.name)}</option>`).join('')}</select>${eligible.length?'':'<p class="field-help">当前没有支持此凭据方式的站点。</p>'}</div>`;
   }
   updateAccountSubmit();
@@ -256,13 +289,13 @@ function updateAccountSubmit(){
   syncCredentialLabels();
   const submit=$('#account-submit');if(!submit)return;
   submit.disabled=state.busy||(!state.editing&&!eligibleProviders().length);
-   submit.textContent=state.busy?'正在保存…':state.editing?'保存修改':state.loginMethod==='session'?'校验并保存':'保存账号';
+   submit.textContent=state.busy?'正在保存…':state.editing?'保存修改':'保存账号';
 }
 function syncMethod(){
   $$('[data-method]').forEach(b=>{
     b.classList.toggle('active',b.dataset.method===state.loginMethod);
     b.setAttribute('aria-pressed',String(b.dataset.method===state.loginMethod));
-    const candidates=providers().filter(p=>state.editing?p.id===state.editing.provider:state.targetProvider?p.id===state.targetProvider:p.id!==state.connecting?.provider);
+    const candidates=providers().filter(p=>state.editing?p.id===state.editing.provider:state.targetProvider?p.id===state.targetProvider:true);
     b.disabled=!candidates.some(p=>(p.login_methods||[]).includes(b.dataset.method));
   });
   platformPicker();
@@ -273,10 +306,6 @@ function syncMethod(){
 }
 function credentialFields(method,editing=false){
   const f=$('#credentials');if(!f)return;
-  if(isBrowser(method)){
-    f.innerHTML='';
-    return;
-  }
   const preserve=editing&&accountMethod(state.editing)===method;
   if(method==='password'){
     f.innerHTML=`<div class="form-grid credential-inputs"><div class="field"><label id="credential-login-label">用户名或邮箱</label><input name="email" type="text" maxlength="200" placeholder="${preserve?'留空则保留已保存的账号':'本站用户名或邮箱'}" ${preserve?'':'required'} autocomplete="username"></div><div class="field"><label>登录密码</label><input name="password" type="password" maxlength="300" placeholder="${preserve?'留空则保留已保存的密码':'本站登录密码'}" ${preserve?'':'required'} autocomplete="new-password"></div></div><p id="credential-provider-hint" class="credential-provider-hint"></p>`;
@@ -303,7 +332,7 @@ function syncCredentialLabels(){
   const session=$('[name="session"]');
   if(session&&!state.editing)session.placeholder=sub2api?'本站 Local Storage 中 auth_token 的值':'本站 session Cookie 原值';
   const hint=$('#credential-provider-hint');
-  if(hint)hint.textContent=state.loginMethod==='password'?(provider?.id==='agentrouter'?'填写 AgentRouter 站内用户名或邮箱与密码。仅用 GitHub / LinuxDO 登录且未设置本站密码时，请选择 Session。后台运行使用服务器网络，登录和奖励以本站响应为准。':'填写本站账号与密码，后台运行时使用服务器网络登录；验证码或防护无法通过时，请改用 Session。'):provider?.id==='agentrouter'?'AgentRouter：Session 和用户 ID 可同步余额，不代表已领取登录奖励。':'填写同一站点的有效凭据，后台只读校验身份与余额后才保存。';
+  if(hint)hint.textContent=state.loginMethod==='password'?(provider?.id==='agentrouter'?'填写 AgentRouter 站内用户名或邮箱与密码。仅用 GitHub / LinuxDO 登录且未设置本站密码时，请选择 Session。后台运行使用服务器网络，登录和奖励以本站响应为准。':'填写本站账号与密码，后台运行时使用服务器网络登录；验证码或防护无法通过时，请改用 Session。'):provider?.id==='agentrouter'?'AgentRouter：填写后直接保存，运行时更新余额；同步余额不代表已领取登录奖励。':'填写后直接保存，首次运行时核对登录状态并更新余额。';
   const instructions=$('#credential-help-instructions');
   if(instructions)instructions.textContent=sub2api?'先在本站登录。在开发者工具 Application → Local Storage 复制 auth_token，在 user 中查看 id。请填写登录 Token，不是模型 API Key。':'先在本站登录。在开发者工具 Application → Cookies 复制 session 的原值，在 Local Storage → user 中查看 id。只填字段值，不粘贴整段 Cookie 请求头。';
   const summary=$('#credential-help-summary');if(summary)summary.textContent=sub2api?'如何获取登录 Token 和用户 ID':'如何获取 Session 和用户 ID';
@@ -337,7 +366,7 @@ function validateAccountForm(form,focus=true){
   }
   if(!state.selectedProviders.length){
     const target=$('[name="providers"],[name="provider"]',form)||$('#platform-picker');
-    errors.push([target,'请至少选择一个授权平台']);
+    errors.push([target,'请选择一个站点']);
   }
   errors.sort((a,b)=>a[0]===b[0]?0:(a[0].compareDocumentPosition(b[0])&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));
   for(const [input,message] of errors){
@@ -365,9 +394,6 @@ async function saveAccount(form){
     if(!name)throw new Error('请先填写账号备注');
     const selected=editing?[editing.provider]:state.selectedProviders;
     if(!selected.length)throw new Error('请至少选择一个平台');
-    if(isBrowser(method)&&(!editing||state.reauth)){
-      return launchLogin({method,interval_hours:Number(data.interval_hours),name,account_id:editing?.id||null,proxy:proxyPayload(form)},selected);
-    }
     const mode=method==='password'?'password':'session';
     if(mode==='session'&&(!editing||data.session||data.api_user||state.reauth)){
       const session=(data.session||'').trim(),api_user=(data.api_user||'').trim();
@@ -379,17 +405,17 @@ async function saveAccount(form){
       let result;
       try{result=await api('/api/accounts/import',{method:'POST',body:{...payload,request_id:requestId}});}
       catch(error){if(error.status===410||error.status===409&&/管理员或站点设置已变化|先前保存的账号已移除|本次保存已取消|此保存请求已用于其他内容/.test(error.message))credentialRequests.delete(form);throw error;}
-      if(result.status!=='success')throw new Error(result.message||'账号尚未保存，请查看当前连接状态。');
+      if(result.status!=='success')throw new Error(result.message||'账号尚未保存，请重试。');
       credentialRequests.delete(form);
       if(form.isConnected){form.reset();closeModal();}
-      toast(result.message||'本站身份和余额已校验，账号已保存');await refresh(true);return;
+      toast('账号已保存，可运行签到更新余额');await refresh(true);return;
     }
     const body={name,provider:editing?.provider||selected[0],auth_mode:mode,interval_hours:Number(data.interval_hours),enabled:editing?editing.enabled:true};
     body.proxy=proxyPayload(form);
-    if(!isBrowser(method))body.login_via=method;
+    body.login_via=method;
     for(const k of ['password','session','api_user','email'])if(data[k])body[k]=data[k];
     await api(editing?`/api/accounts/${editing.id}`:'/api/accounts',{method:editing?'PUT':'POST',body});
-    if(form.isConnected){form.reset();closeModal();}toast(editing?'账号设置已更新':'账号已保存，首次运行时会验证登录并查询余额');await refresh(true);
+    if(form.isConnected){form.reset();closeModal();}toast(editing?'账号设置已更新':'账号已保存，可运行签到更新余额');await refresh(true);
   }finally{state.busy=false;updateAccountSubmit();}
 }
 function accountTransferActive(transfer){return !!transfer&&accountFileTransfer===transfer&&!transfer.closed&&transfer.form?.isConnected&&$('#modal').open&&state.auth?.authenticated!==false;}
@@ -569,7 +595,6 @@ function downloadAccountTemplate(){
   ]};
   downloadAccountJson(sample,'checkin-assistant-accounts-example.json',true);toast('示例已下载，请替换示例凭据后再导入。');
 }
-function queueActive(queue){return !!queue&&state.loginQueue===queue&&!queue.stopped&&!queue.done;}
 function userSiteUrl(providerId){
  const provider=allProviders().find(p=>p.id===providerId);
  if(!provider)return null;
@@ -579,164 +604,11 @@ function userSiteUrl(providerId){
   return url.href;
  }catch{return null;}
 }
-function updateUserConnection(queue,result){
- if(!userBrowserAuthorization())return;
- queue.connection=result.connection||queue.connection||null;
- queue.expiresAt=result.expires_at||queue.expiresAt||null;
-}
-function clearBrowserImportFields(){
- $('#browser-import-form')?.reset();
-}
-function restoreAuthorization(current){
- if(!current||!state.data?.web?.enabled||queueActive(state.loginQueue)||!['starting','waiting','verifying'].includes(current.status))return;
- const queue={options:{method:current.method,name:current.name||'',account_id:current.account_id||null,interval_hours:6},items:[{provider:current.provider,status:'waiting',message:current.message||'已恢复当前连接，请填写本站登录状态。'}],index:0,session:current.id,stopped:false,done:false,starting:false,polling:false,cancelling:false,recovered:true};
- state.loginQueue=queue;state.loginSession=current.id;updateUserConnection(queue,current);renderLoginQueue(queue);void pollLogin(queue);
-}
-function launchLogin(options,selected=[options.provider]){
-  if(state.loginQueue&&!state.loginQueue.stopped&&!state.loginQueue.done)return;
-  const queue={options,items:selected.map(provider=>({provider,status:'pending',message:'等待连接'})),index:0,session:null,stopped:false,done:false,starting:false,polling:false,cancelling:false};
-  state.loginQueue=queue;
-  void startQueueItem(queue);
-}
-function renderLoginQueue(queue){
- if(state.loginQueue!==queue||queue.stopped)return;
- const item=queue.items[queue.index],finished=queue.items.filter(i=>i.status==='success').length;
- const statuses={pending:'等待',starting:'准备中',waiting:'等待填写',verifying:'正在校验',success:'已保存',error:'未完成',network:'连接中断',unknown:'待确认',skipped:'已跳过'};
- const progress=`<ol class="platform-progress" aria-live="polite">${queue.items.map((entry,index)=>`<li class="${esc(entry.status)} ${index===queue.index&&!queue.done?'current':''}"><div><b>${providerName(entry.provider)}</b><span>${statuses[entry.status]||esc(entry.status)}</span></div><p>${esc(entry.message)}</p></li>`).join('')}</ol>`;
- const actions=queue.done?'<button class="button primary" data-action="close">完成</button>':`<button class="button secondary" data-action="cancel-login">取消连接</button>${item.status==='error'?'<button class="button primary" data-action="close">关闭并重新填写</button>':''}${item.status==='network'?'<button class="button primary" data-action="retry-poll">查询当前连接</button>':''}`;
- if(!$('#queue-progress'))modal(`<div class="modal-head"><div><h2 id="dialog-title"></h2><p id="queue-subtitle"></p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><div id="queue-progress"></div><section id="user-browser-authorization" class="user-browser-authorization" aria-label="手动填写登录状态" hidden><p id="user-browser-agent-hint" class="browser-agent-hint" hidden>AgentRouter：Session 和用户 ID 可同步余额，不代表已领取登录奖励。</p><div id="manual-browser-import" class="browser-manual-import"><form id="browser-import-form" novalidate><div class="form-errors-summary" role="alert" hidden></div><div class="field"><label for="browser-import-session" id="browser-import-session-label">Session Cookie</label><input id="browser-import-session" name="session" type="password" required maxlength="32000" autocomplete="off" placeholder="本站 session Cookie 原值"></div><div class="field"><label for="browser-import-user">站内用户 ID</label><input id="browser-import-user" name="api_user" required maxlength="100" inputmode="numeric" pattern="[1-9][0-9]*" autocomplete="off" placeholder="本站 user 中的 id"></div><details class="credential-help"><summary>如何获取本站登录状态</summary><p id="browser-import-instructions"></p><a id="user-browser-site" class="panel-link" target="_blank" rel="noopener noreferrer">打开站点登录页 ${icon('link')}</a></details><button class="button primary small" type="submit" id="browser-import-submit">校验并保存</button></form></div></section><div class="modal-actions" id="queue-actions"></div>`);
- $('#dialog-title').textContent=queue.done?'连接结果':'填写登录状态';
- $('#queue-subtitle').innerHTML=queue.done?`${finished} / ${queue.items.length} 个站点已保存`:`${queue.recovered?'已恢复当前连接':'当前连接'} · ${providerName(item.provider)}`;
- const progressElement=$('#queue-progress'),actionsElement=$('#queue-actions');
- if(progressElement.innerHTML!==progress)progressElement.innerHTML=progress;
- if(actionsElement.innerHTML!==actions)actionsElement.innerHTML=actions;
- const section=$('#user-browser-authorization');section.hidden=queue.done||!queue.session||item.status==='error';
- if(queue.session){
-  const form=$('#browser-import-form'),provider=allProviders().find(p=>p.id===item.provider),sub2api=provider?.template?.startsWith('sub2api');
-  if(form.dataset.session!==queue.session){form.reset();form.dataset.session=queue.session;$('.form-errors-summary',form).hidden=true;}
-  $('#user-browser-site').href=userSiteUrl(item.provider)||'#';
-  $('#browser-import-submit').disabled=!!queue.importing||item.status==='verifying';
-  $('#browser-import-submit').textContent=queue.importing||item.status==='verifying'?'正在校验…':'校验并保存';
-  $('#user-browser-agent-hint').hidden=item.provider!=='agentrouter';
-  $('#browser-import-instructions').textContent=sub2api?'在本站开发者工具 Application → Local Storage 复制 auth_token，在 user 中查看 id。请填写登录 Token，不是模型 API Key。':'在本站开发者工具 Application → Cookies 复制 session 的原值，在 Local Storage → user 查看 id。只填字段值，不粘贴整段 Cookie 请求头。';
-  $('#browser-import-session-label').textContent=sub2api?'登录 Token（不是 API Key）':'Session Cookie';
-  $('#browser-import-session').placeholder=sub2api?'本站 Local Storage 中 auth_token 的值':'本站 session Cookie 原值';
- }
-}
-async function startQueueItem(queue){
-  if(!queueActive(queue)||queue.starting)return;
-  const item=queue.items[queue.index];
-  queue.starting=true;
-  item.status='starting';item.message='正在准备账号校验…';
-  renderLoginQueue(queue);
-  try{
-    const res=await api('/api/login/start',{method:'POST',body:{...queue.options,provider:item.provider}});
-    if(!res.id)throw new Error('服务未返回连接会话编号，结果尚无法确认');
-    queue.session=res.id;
-    if(!queueActive(queue)){await cancelLoginSession(queue,res.id);return;}
-    state.loginSession=res.id;
-    updateUserConnection(queue,res);
-    item.status='waiting';item.message=res.message||'请填写本站登录状态，校验通过后保存。';
-    renderLoginQueue(queue);
-    void pollLogin(queue);
-  }catch(error){
-    if(!queueActive(queue)){toast('连接请求结果尚未确认，请检查账号列表；队列已停止。');return;}
-    if(error.definitive)queue.connection=null;
-    item.status=error.definitive?'error':'unknown';
-    item.message=error.definitive?error.message:`网络或响应异常：${error.message}。请求可能已到达服务，请先核对账号列表。`;
-    renderLoginQueue(queue);
-  }finally{queue.starting=false;}
-}
-async function pollLogin(queue){
-  if(!queueActive(queue)||queue.polling||!queue.session)return;
-  queue.polling=true;
-  const id=queue.session,item=queue.items[queue.index];
-  try{
-    const result=await api(`/api/login/${encodeURIComponent(id)}`);
-    if(!queueActive(queue)||queue.session!==id)return;
-    updateUserConnection(queue,result);
-    item.message=result.message||'等待当前站点完成登录与导入…';
-    if(result.status==='success'){
-      await finishQueueItem(queue,id,result);
-      return;
-    }
-    if(['error','cancelled','expired','unavailable','failed'].includes(result.status)){
-      item.status='error';queue.session=null;queue.connection=null;state.loginSession=null;
-      clearBrowserImportFields();
-      if(result.status==='unavailable')item.message=result.message||`平台不支持或未提供 ${methodName(queue.options.method)} 入口。`;
-      renderLoginQueue(queue);return;
-    }
-    item.canResume=!!result.verification_paused;item.canContinueOAuth=!!result.oauth_continue_available;
-    item.status=userBrowserAuthorization()?(result.status==='verifying'?'verifying':'waiting'):result.stage==='linuxdo_home'?'oauth_home':result.stage==='resuming_oauth'?'oauth_returning':result.stage==='native_login'?'native':result.verification_auto?'detecting':result.verification_paused?'blocked':'waiting';renderLoginQueue(queue);
-    loginPoll=setTimeout(()=>pollLogin(queue),1000);
-  }catch(error){
-    if(!queueActive(queue)||queue.session!==id)return;
-    item.status='network';item.message=`查询失败：${error.message}。可重试查询同一会话，不会再次创建连接。`;
-    renderLoginQueue(queue);
-  }finally{
-    queue.polling=false;
-    if(queueActive(queue)&&queue.session&&queue.session!==id){
-      clearTimeout(loginPoll);loginPoll=setTimeout(()=>pollLogin(queue),0);
-    }
-  }
-}
-async function finishQueueItem(queue,id,result){
- if(!queueActive(queue)||queue.session!==id)return;
- const item=queue.items[queue.index];
- item.status='success';item.message=result.message||'本站身份已确认，登录状态已加密保存。';
- queue.session=null;queue.connection=null;state.loginSession=null;clearBrowserImportFields();
- renderLoginQueue(queue);await refresh(true);
- if(queueActive(queue))advanceQueue(queue);
-}
-async function submitBrowserImport(form){
- const queue=state.loginQueue,id=form.dataset.session;
- if(!queueActive(queue)||!id||queue.session!==id||queue.importing||queue.items[queue.index].status==='verifying')return;
- const summary=$('.form-errors-summary',form),data=Object.fromEntries(new FormData(form));
- summary.hidden=true;
- const session=(data.session||'').trim(),api_user=(data.api_user||'').trim();
- if(!session||!(/^[1-9][0-9]*$/).test(api_user))throw new Error('请填写本站登录凭据和有效的数字用户 ID。');
- queue.importing=true;renderLoginQueue(queue);
- try{
-  const result=await api(`/api/login/${encodeURIComponent(id)}/import`,{method:'POST',body:{session,api_user}});
-  if(!queueActive(queue)||queue.session!==id)return;
-  if(result.status==='success')await finishQueueItem(queue,id,result);
-  else{queue.items[queue.index].status=result.status==='verifying'?'verifying':'waiting';queue.items[queue.index].message=result.message||'正在确认本站身份…';renderLoginQueue(queue);}
- }catch(error){
-  if(queueActive(queue)&&queue.session===id){summary.hidden=false;summary.textContent=error.message;}
- }finally{queue.importing=false;if(queueActive(queue)&&queue.session===id)renderLoginQueue(queue);}
-}
-function advanceQueue(queue){
-  if(!queueActive(queue))return;
-  if(queue.index+1>=queue.items.length){queue.done=true;queue.connection=null;renderLoginQueue(queue);return;}
-  queue.index++;
-  // 等当前轮询退出后才发起下一平台，避免共享状态与轮询重叠。
-  loginPoll=setTimeout(()=>startQueueItem(queue),0);
-}
-async function cancelLoginSession(queue,id){
-  if(queue.cancelling)return;
-  queue.cancelling=true;
-  try{
-    const result=await api(`/api/login/${encodeURIComponent(id)}/cancel`,{method:'POST',body:{}});
-    if(result.status==='success')toast('队列已停止；当前平台在取消前已保存，账号会保留。');
-    else toast('队列已停止，已完成的账号保留。');
-    if(queue.session===id)queue.session=null;
-    await refresh(true);
-  }catch(error){toast(`队列已停止，但取消连接尚未确认：${error.message}。请查询当前连接状态。`);}
-  finally{queue.cancelling=false;}
-}
 async function toggleScheduler(){const s=state.data.settings;await api('/api/settings',{method:'PATCH',body:{scheduler_enabled:!s.scheduler_enabled,interval_hours:s.interval_hours}});await refresh(true);toast(!s.scheduler_enabled?'自动签到已启用':'自动签到已暂停');}
 document.addEventListener('click',async e=>{const btn=e.target.closest('button');if(!btn)return;try{
- if(btn.dataset.view){state.view=btn.dataset.view;location.hash=state.view;render();} else if(btn.dataset.logFilter){state.logFilter=btn.dataset.logFilter;render();}
+ if(btn.dataset.view){const changed=state.view!==btn.dataset.view;state.view=btn.dataset.view;location.hash=state.view;if(changed)render();} else if(btn.dataset.logFilter){state.logFilter=btn.dataset.logFilter;render();}
  else if(btn.dataset.filter){state.filter=btn.dataset.filter;render();}
- else if(btn.dataset.method){state.loginMethod=btn.dataset.method;state.reauth=isBrowser(btn.dataset.method);syncMethod();}
- else if(btn.dataset.action==='select-all-platforms'){state.selectedProviders=eligibleProviders().map(p=>p.id);platformPicker();}
- else if(btn.dataset.action==='cancel-login')closeModal();
- else if(btn.dataset.action==='retry-login'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='error')void startQueueItem(q);}
- else if(btn.dataset.action==='skip-login'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='error'){q.items[q.index].status='skipped';advanceQueue(q);}}
- else if(btn.dataset.action==='resume-login'){const q=state.loginQueue;if(queueActive(q)&&q.session){await api(`/api/login/${encodeURIComponent(q.session)}/resume`,{method:'POST',body:{}});q.items[q.index].status='waiting';q.items[q.index].message='正在重新校验目标平台身份…';renderLoginQueue(q);}}
- else if(btn.dataset.action==='continue-oauth'){const q=state.loginQueue;if(queueActive(q)&&q.session&&q.items[q.index].canContinueOAuth){q.items[q.index].canContinueOAuth=false;q.items[q.index].status='oauth_returning';q.items[q.index].message='正在返回原站点继续授权…';renderLoginQueue(q);await api(`/api/login/${encodeURIComponent(q.session)}/continue-oauth`,{method:'POST',body:{}});}}
- else if(btn.dataset.action==='retry-poll'){const q=state.loginQueue;if(queueActive(q)&&q.items[q.index].status==='network')void pollLogin(q);}
- else if(btn.dataset.action==='connect-platform'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(a&&isOAuth(a.login_via))accountModal(null,a);}
+ else if(btn.dataset.method){state.loginMethod=btn.dataset.method;state.reauth=false;syncMethod();}
  else if(btn.dataset.action==='relogin'){const a=state.data.accounts.find(x=>x.id===Number(btn.dataset.id));if(!a)return;accountModal(a);state.reauth=true;syncMethod();}
  else if(btn.dataset.exportFormat){const transfer=accountFileTransfer;if(accountTransferActive(transfer)&&transfer.kind==='export'&&!transfer.busy){transfer.generation++;transfer.encrypted=btn.dataset.exportFormat==='encrypted';for(const input of $$('#account-export-passwords input'))input.value='';clearTransferErrors(transfer);syncAccountTransfer(transfer);}}
  else if(btn.dataset.action==='accounts-import')accountImportModal();
@@ -761,7 +633,7 @@ document.addEventListener('click',async e=>{const btn=e.target.closest('button')
  else if(btn.dataset.action==='export'){const a=document.createElement('a');a.href='/api/logs/export';a.download='checkin-assistant-logs.csv';a.click();toast('已导出当前日志');}
  else if(btn.dataset.action==='log')logModal(state.data.runs.find(x=>x.id===Number(btn.dataset.id)));
  }catch(err){const summary=$('#modal[role="alertdialog"] .form-errors-summary');if(summary){summary.hidden=false;summary.textContent=err.message||'操作未完成，请重试。';}else toast(err.message||'操作未完成');await refresh(true);}finally{if(btn.isConnected)btn.disabled=false;}});
-document.addEventListener('submit',async e=>{e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;try{if(e.target.id==='auth-form')await submitAuth(e.target);if(e.target.id==='password-form')await submitPassword(e.target);if(e.target.id==='account-form')await saveAccount(e.target);if(e.target.id==='account-export-form')await exportAccountFile(e.target);if(e.target.id==='account-import-form')await submitAccountImport(e.target,submit?.value||'preview');if(e.target.id==='browser-import-form')await submitBrowserImport(e.target);if(e.target.id==='provider-form')await saveProvider(e.target);if(e.target.id==='settings-form'){const body=Object.fromEntries(new FormData(e.target));body.scheduler_enabled=body.scheduler_enabled==='true';body.interval_hours=Number(body.interval_hours);await api('/api/settings',{method:'PATCH',body});closeModal();toast('定时设置已保存');await refresh(true);}}catch(err){const summary=$('.form-errors-summary',e.target);if(summary){summary.hidden=false;summary.textContent=err.message;}else toast(err.message);}finally{if(submit?.isConnected){if(['account-export-form','account-import-form'].includes(e.target.id))syncAccountTransfer(accountFileTransfer);else if(e.target.id==='browser-import-form'&&queueActive(state.loginQueue))renderLoginQueue(state.loginQueue);else submit.disabled=false;}}});
+document.addEventListener('submit',async e=>{e.preventDefault();const submit=e.submitter;if(submit)submit.disabled=true;try{if(e.target.id==='auth-form')await submitAuth(e.target);if(e.target.id==='password-form')await submitPassword(e.target);if(e.target.id==='account-form')await saveAccount(e.target);if(e.target.id==='account-export-form')await exportAccountFile(e.target);if(e.target.id==='account-import-form')await submitAccountImport(e.target,submit?.value||'preview');if(e.target.id==='provider-form')await saveProvider(e.target);if(e.target.id==='settings-form'){const body=Object.fromEntries(new FormData(e.target));body.scheduler_enabled=body.scheduler_enabled==='true';body.interval_hours=Number(body.interval_hours);await api('/api/settings',{method:'PATCH',body});closeModal();toast('定时设置已保存');await refresh(true);}}catch(err){const summary=$('.form-errors-summary',e.target);if(summary){summary.hidden=false;summary.textContent=err.message;}else toast(err.message);}finally{if(submit?.isConnected){if(['account-export-form','account-import-form'].includes(e.target.id))syncAccountTransfer(accountFileTransfer);else submit.disabled=false;}}});
 document.addEventListener('input',e=>{if(e.target.id==='account-search'){state.query=e.target.value;const pos=e.target.selectionStart;render();const input=$('#account-search');input.focus();input.setSelectionRange(pos,pos);}});
 document.addEventListener('change',e=>{
   if(e.target.id==='account-import-file')void selectAccountImportFile(e.target).catch(()=>transferError(accountFileTransfer,'文件读取未完成，请重新选择。'));
@@ -769,7 +641,6 @@ document.addEventListener('change',e=>{
   if(e.target.id==='account-export-scope'){if(accountFileTransfer)accountFileTransfer.generation++;clearTransferErrors(accountFileTransfer);syncAccountTransfer(accountFileTransfer);}
   if(e.target.id==='currency-picker'){state.currency=e.target.value;render();}
   if(['proxy_mode','proxy_auth','proxy_server'].includes(e.target.name))syncProxy();
-  if(e.target.name==='providers'){state.selectedProviders=$$('input[name="providers"]:checked').map(input=>input.value);updateAccountSubmit();}
   if(e.target.name==='provider'&&!state.editing){state.selectedProviders=[e.target.value];updateAccountSubmit();}
 });
 document.addEventListener('input',e=>{if(e.target.name==='proxy_server')syncProxy();});
@@ -784,10 +655,12 @@ $('#modal').addEventListener('close',()=>{if(!$('#modal').open)disposeAccountTra
 window.__checkinEnabledAccounts=()=>state.data?state.data.accounts.filter(a=>a.enabled).length:0;
 
 async function returnToLogin(){
+ resetRefresh();
+ const epoch=refreshEpoch;
  disposeAccountTransfer();
- stopLoginPoll();const queue=state.loginQueue;if(queue){queue.stopped=true;queue.connection=null;}clearBrowserImportFields();state.loginQueue=null;state.loginSession=null;state.data=null;if($('#modal').open)$('#modal').close();
+ const accountForm=$('#account-form');if(accountForm){accountForm.reset();credentialRequests.delete(accountForm);}state.data=null;if($('#modal').open)$('#modal').close();
  state.auth={...(state.auth||{}),web_mode:true,authenticated:false,configured:true};$('#workspace-shell').hidden=true;renderAuth();
- try{state.auth=await api('/api/auth/status');renderAuth();}catch{}
+ try{const auth=await api('/api/auth/status');if(epoch===refreshEpoch){state.auth=auth;renderAuth();}}catch{}
 }
 function authBrand(){return `<a class="brand" href="#overview" aria-label="签到助手"><span class="brand-mark">${icon('checkin')}</span><span>签到助手</span></a>`;}
 function renderAuth(){
@@ -819,28 +692,33 @@ async function submitAuth(form){
  if(setup&&data.password!==data.confirm_password)return authFormError(form,'两次输入的密码不一致。',['auth-confirm']);
  if(!setup&&Array.from(data.password).length>1024)return authFormError(form,'登录密码不能超过 1024 个字符。',['auth-password']);
  const submit=$('[type="submit"]',form),markup=submit.innerHTML;submit.textContent=setup?'正在设置登录账号':'正在登录';form.setAttribute('aria-busy','true');
- try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:{username:data.username.trim(),password:data.password}});state.auth={...(state.auth||{}),...result,authenticated:true,configured:true,web_mode:true,setup_required:false};$('#auth-screen').hidden=true;$('#workspace-shell').hidden=false;state.data=null;state.authorizationChecked=false;await refresh(false);}
+ try{const result=await api(setup?'/api/auth/setup':'/api/auth/login',{method:'POST',body:{username:data.username.trim(),password:data.password}});resetRefresh();state.auth={...(state.auth||{}),...result,authenticated:true,configured:true,web_mode:true,setup_required:false};$('#auth-screen').hidden=true;$('#workspace-shell').hidden=false;state.data=null;await refresh(false);}
  catch(error){
   if(setup&&error.status===409){
    let auth;try{auth=await api('/api/auth/status');}catch{}
-   if(auth?.configured&&!auth.setup_required){state.auth=auth;state.data=null;state.authorizationChecked=false;if(auth.authenticated){$('#auth-screen').hidden=true;$('#workspace-shell').hidden=false;await refresh(false);return;}renderAuth();$('#auth-username').value=data.username.trim();authFormError($('#auth-form'),'登录账号已经设置，请使用已设置的账号和密码登录。',['auth-username','auth-password']);return;}
+   if(auth?.configured&&!auth.setup_required){resetRefresh();state.auth=auth;state.data=null;if(auth.authenticated){$('#auth-screen').hidden=true;$('#workspace-shell').hidden=false;await refresh(false);return;}renderAuth();$('#auth-username').value=data.username.trim();authFormError($('#auth-form'),'登录账号已经设置，请使用已设置的账号和密码登录。',['auth-username','auth-password']);return;}
   }
   if(form.isConnected)authFormError(form,error.message,['auth-username','auth-password']);
  }
  finally{form.removeAttribute('aria-busy');if(submit.isConnected)submit.innerHTML=markup;}
 }
-async function logout(){await api('/api/auth/logout',{method:'POST',body:{}});disposeAccountTransfer();if($('#modal').open)$('#modal').close();state.data=null;state.auth={...state.auth,authenticated:false};renderAuth();}
+async function logout(){await api('/api/auth/logout',{method:'POST',body:{}});resetRefresh();disposeAccountTransfer();const form=$('#account-form');if(form){form.reset();credentialRequests.delete(form);}if($('#modal').open)$('#modal').close();state.data=null;state.auth={...state.auth,authenticated:false};renderAuth();}
 function adminModal(){const username=state.auth?.username||'管理员';modal(`<div class="modal-head"><div><h2>工作空间设置</h2><p>管理你的控制台登录账号。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><div class="admin-summary"><span class="user-avatar">${esc(username.slice(0,1).toUpperCase())}</span><div><b>${esc(username)}</b><small>工作空间管理员</small></div></div><div class="admin-actions"><button class="button secondary" data-action="password-settings">${icon('key')}修改登录密码</button><button class="button ghost danger" data-action="logout">${icon('logout')}退出当前登录</button></div>`);}
 function passwordModal(){modal(`<div class="modal-head"><div><h2>修改登录密码</h2><p>更新后其他设备需使用新密码重新登录。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><form id="password-form"><div class="form-errors-summary" role="alert" hidden></div><div class="field"><label for="current-password">当前密码</label><input id="current-password" name="current_password" type="password" required autocomplete="current-password"></div><div class="field"><label for="new-password">新密码</label><input id="new-password" name="new_password" type="password" required minlength="12" maxlength="1000" autocomplete="new-password" placeholder="至少 12 个字符，组合字母、数字或符号"></div><div class="field"><label for="confirm-password">确认新密码</label><input id="confirm-password" name="confirm_password" type="password" required minlength="12" autocomplete="new-password"></div><div class="modal-actions"><button type="button" class="button secondary" data-action="close">取消</button><button class="button primary" type="submit">更新密码</button></div></form>`);}
-async function submitPassword(form){const data=Object.fromEntries(new FormData(form));if(data.new_password!==data.confirm_password)throw new Error('两次输入的新密码不一致。');const result=await api('/api/auth/password',{method:'POST',body:{current_password:data.current_password,new_password:data.new_password}});state.auth={...state.auth,...result};closeModal();toast('登录密码已更新，其他设备需重新登录。');await refresh(true);}
-function aboutModal(){modal(`<div class="modal-head"><div><h2>数据与运行说明</h2><p>了解工作空间如何处理账号与额度。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><div class="about-grid"><section><h3>每个平台独立连接</h3><p>站点 Session、站内用户标识和网络代理分别保存。GitHub 与 LinuxDO 是登录身份，连接多个站点仍需逐个平台授权。AgentRouter 的 OAuth 上游会话用于后续后台登录。</p></section><section><h3>金额与签到分开确认</h3><p>余额来自站点用户接口。签到成功需要站点确认；余额已同步只表示查询成功。奖励无法核对时显示未知，查询失败时保留已有余额。</p></section><section><h3>凭据与用户浏览器</h3><p>${userBrowserAuthorization()?'直接填写本站 Session / 登录 Token 与用户 ID，后台只读校验后保存。也可保存本站账号密码，由任务运行时登录验证；本站未设置密码的第三方登录账号请用 Session。网页无需本机连接器或浏览器扩展。':'请本人在登录窗口完成密码、验证码与授权确认。'}账号凭据加密保存在应用数据库中，备份时应同时保存数据库与加密密钥。</p></section><section><h3>后台运行</h3><p>服务运行期间按账号间隔执行任务。关闭网页不会停止调度；服务器停止时任务暂停。网站要求人工验证时，请主动重新连接处理。</p></section></div><div class="modal-actions"><button class="button primary" data-action="close">知道了</button></div>`);}
+async function submitPassword(form){const data=Object.fromEntries(new FormData(form));if(data.new_password!==data.confirm_password)throw new Error('两次输入的新密码不一致。');const result=await api('/api/auth/password',{method:'POST',body:{current_password:data.current_password,new_password:data.new_password}});resetRefresh();state.auth={...state.auth,...result};closeModal();toast('登录密码已更新，其他设备需重新登录。');await refresh(true);}
+function aboutModal(){modal(`<div class="modal-head"><div><h2>数据与运行说明</h2><p>了解工作空间如何处理账号与额度。</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><div class="about-grid"><section><h3>每个站点独立管理</h3><p>为每个站点手动填写自己的 Session、登录 Token 或账号密码。站内用户 ID 和网络代理分别保存，填写完成后直接保存账号。</p></section><section><h3>金额与签到分开确认</h3><p>余额来自站点用户接口。签到成功需要站点确认；余额已同步只表示查询成功。奖励无法核对时显示未知，查询失败时保留已有余额。</p></section><section><h3>凭据与余额</h3><p>保存账号时不连接原站，首次运行时核对登录状态并更新余额。未设置本站密码的第三方登录账号，请填写 Session。凭据加密保存在应用数据库中，备份时应同时保存数据库与加密密钥。</p></section><section><h3>后台运行</h3><p>服务运行期间按账号间隔执行任务。关闭网页不会停止调度；服务器停止时任务暂停。网站要求人工验证时，请主动重新连接处理。</p></section></div><div class="modal-actions"><button class="button primary" data-action="close">知道了</button></div>`);}
 function logModal(r){if(!r)return;modal(`<div class="modal-head"><div><h2>${esc(r.account_name)}</h2><p>${providerName(r.provider)} · ${timeLabel(r.started_at,true)}</p></div><button class="icon-button" data-action="close" aria-label="关闭">${icon('x')}</button></div><div class="log-detail-grid"><div><span>运行结果</span>${statusBadge(r.status)}</div><div><span>触发方式</span><b>${r.trigger==='manual'?'手动运行':'定时运行'}</b></div><div><span>签到前余额</span><b>${money(r.before_balance,r.currency)}</b></div><div><span>签到后余额</span><b>${money(r.after_balance,r.currency)}</b></div><div><span>可确认新增额度</span><b>${r.reward==null?'奖励未知':money(r.reward,r.currency)}</b></div><div><span>运行耗时</span><b>${r.duration_ms==null?'未知':(r.duration_ms/1000).toFixed(1)+' 秒'}</b></div></div><div class="log-description">${esc(r.message)}</div><div class="modal-actions"><button class="button primary" data-action="close">完成</button></div>`);}
 async function init(){
  const hash=location.hash.slice(1);if(['overview','accounts','sites','logs'].includes(hash))state.view=hash;
  try{state.auth=await api('/api/auth/status');if(state.auth.authenticated){$('#auth-screen').hidden=true;$('#workspace-shell').hidden=false;await refresh(false);}else renderAuth();}
  catch(error){if(error.status===404){state.auth={authenticated:true,web_mode:false};await refresh(false);}else{connectionStatus(false);toast('服务连接未完成，请刷新后重试。');}}
- refreshTimer=setTimeout(refreshLoop,5000);
+ scheduleRefresh();scheduleClock();
 }
-async function refreshLoop(){if(document.visibilityState!=='hidden'&&state.auth?.authenticated!==false)await refresh(true);refreshTimer=setTimeout(refreshLoop,5000);}
-window.addEventListener('hashchange',()=>{const view=location.hash.slice(1);if(['overview','accounts','sites','logs'].includes(view)&&state.data){state.view=view;render();}});
+async function refreshLoop(){refreshTimer=null;try{await refresh(true,{background:true});}finally{scheduleRefresh();}}
+document.addEventListener('visibilitychange',()=>{
+ clearTimeout(refreshTimer);refreshTimer=null;clearTimeout(clockTimer);clockTimer=null;
+ if(document.visibilityState!=='hidden'){updateRunTimes();scheduleClock();void refresh(true);}
+});
+window.addEventListener('online',()=>{refreshFailures=0;void refresh(true);});
+window.addEventListener('hashchange',()=>{const view=location.hash.slice(1);if(view!==state.view&&['overview','accounts','sites','logs'].includes(view)&&state.data){state.view=view;render();}});
 void init();
