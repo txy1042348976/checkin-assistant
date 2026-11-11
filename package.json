@@ -11,7 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist-server/main.js",
     "dev": "tsx server/main.ts",
-    "test": "tsx --test tests-node/*.test.ts",
+    "test": "tsx --test --test-concurrency=2 tests-node/*.test.ts",
     "test:ui": "node tests-node/ui-smoke.mjs",
     "test:ui:accounts": "node tests-node/account-transfer-ui-smoke.mjs",
     "test:docker": "node tests-node/docker-smoke.mjs",
