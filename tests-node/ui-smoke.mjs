@@ -798,6 +798,11 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     const descriptor = await api.request(`/api/browser-import/${cancelledConnection.id}`, {auth: false, headers: {Authorization: `Bearer ${cancelledConnection.ticket}`}});
     assert.equal(descriptor.status, 200); assert.equal(descriptor.data.provider.id, 'anyrouter');
     assert.ok(!descriptor.text.includes(cancelledConnection.ticket));
+    const cancelButton = await page.locator('[data-action="cancel-login"]').elementHandle();
+    await cancelButton.focus();
+    await page.evaluate(() => { for (let index = 0; index < 3; index++) renderLoginQueue(state.loginQueue); });
+    assert.equal(await cancelButton.evaluate(element => element.isConnected && document.activeElement === element), true, 'unchanged login polling preserves the cancel control and its focus');
+    await cancelButton.dispose();
     await page.locator('[data-action="cancel-login"]').click(); await page.locator('#modal').waitFor({state: 'hidden'});
     await until(async () => (await api.request(`/api/browser-import/${cancelledConnection.id}`, {auth: false, headers: {Authorization: `Bearer ${cancelledConnection.ticket}`}})).status === 410, 'cancelled old ticket rejected');
     assert.equal(cancelOriginal.isClosed(), false);
