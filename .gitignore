@@ -1,0 +1,35 @@
+# Dependencies and generated code
+node_modules/
+dist-server/
+dist/
+coverage/
+
+# Build, verification and release output
+build/
+artifacts/
+release/
+*.log
+npm-debug.log*
+
+# Private configuration, data and backups
+/data*/
+/backups/
+.env
+.env.*
+!.env.example
+*.key
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/*-data-backup.tar.gz
+checkin_screenshots/
+
+# Local editor and operating system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

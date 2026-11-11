@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f3f4f4">
+  <meta name="description" content="签到助手，自托管的站点签到、额度与账号控制台。">
+  <meta name="robots" content="noindex,nofollow">
+  <title>签到助手</title>
+  <link rel="icon" href="/assets/icons/checkin.svg" type="image/svg+xml">
+  <link rel="preload" href="/assets/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#workspace">跳到主要内容</a>
+<section id="auth-screen" class="auth-screen" aria-label="登录签到助手" hidden></section>
+<div id="workspace-shell" class="app-shell">
+  <aside class="sidebar" aria-label="签到助手工作空间">
+    <a class="brand" href="#overview" aria-label="签到助手首页"><span class="brand-mark" aria-hidden="true"><img src="/assets/icons/checkin.svg" alt="" width="32" height="32"></span><span class="brand-name">签到助手</span></a>
+    <p class="sidebar-caption">你的日常签到工作台</p>
+    <span class="sidebar-nav-label">工作空间</span>
+    <nav class="nav" aria-label="工作空间导航">
+      <button class="nav-item active" type="button" data-view="overview" aria-current="page"><img class="icon" src="/assets/icons/grid.svg" alt="" aria-hidden="true" width="20" height="20"><span>概览</span></button>
+      <button class="nav-item" type="button" data-view="accounts"><img class="icon" src="/assets/icons/users.svg" alt="" aria-hidden="true" width="20" height="20"><span>账号</span><span id="nav-count" class="nav-count count" aria-hidden="true">0</span></button>
+      <button class="nav-item" type="button" data-view="sites"><img class="icon" src="/assets/icons/layers.svg" alt="" aria-hidden="true" width="20" height="20"><span>站点</span></button>
+      <button class="nav-item" type="button" data-view="logs"><img class="icon" src="/assets/icons/list.svg" alt="" aria-hidden="true" width="20" height="20"><span>运行日志</span></button>
+    </nav>
+    <div class="sidebar-foot">
+      <p>每一天，都有条不紊。</p>
+      <button class="sidebar-settings" type="button" data-action="settings" aria-haspopup="dialog" aria-controls="modal"><img class="icon" src="/assets/icons/clock.svg" alt="" aria-hidden="true" width="20" height="20"><span>定时设置</span><img class="icon sidebar-settings-arrow" src="/assets/icons/chevron.svg" alt="" aria-hidden="true" width="16" height="16"></button>
+    </div>
+  </aside>
+  <div class="workspace-main">
+    <header class="topbar">
+      <div class="crumb"><span>工作空间</span><span class="crumb-separator" aria-hidden="true">/</span><b id="crumb">概览</b></div>
+      <a class="mobile-brand" href="#overview" aria-label="签到助手首页"><img src="/assets/icons/checkin.svg" alt="" width="28" height="28"><span>签到助手</span></a>
+      <div class="top-actions">
+        <span id="connection" class="connection" role="status" aria-live="polite" aria-atomic="true"><i aria-hidden="true"></i>正在连接</span>
+        <button class="icon-button topbar-settings" type="button" data-action="settings" aria-label="定时设置" aria-haspopup="dialog" aria-controls="modal"><img src="/assets/icons/settings.svg" alt="" aria-hidden="true" width="20" height="20"></button>
+        <button id="admin-button" class="user-button" type="button" data-action="admin-settings" aria-label="工作空间设置" aria-haspopup="dialog" aria-controls="modal" hidden><span id="user-avatar" class="user-avatar" aria-hidden="true">A</span><span id="user-name">管理员</span><img src="/assets/icons/chevrondown.svg" alt="" aria-hidden="true" width="16" height="16"></button>
+      </div>
+    </header>
+    <main id="workspace" class="content" tabindex="-1">
+      <section class="page-heading" aria-labelledby="page-title">
+        <div><h1 id="page-title">签到概览</h1><p id="page-description">查看站点额度、今日进度与下一次运行。</p></div>
+        <div class="heading-actions"><button class="button secondary" type="button" data-action="add" aria-haspopup="dialog" aria-controls="modal"><img src="/assets/icons/plus.svg" alt="" aria-hidden="true" width="18" height="18">添加账号</button><button class="button primary" type="button" data-action="run-all"><img src="/assets/icons/play.svg" alt="" aria-hidden="true" width="18" height="18">签到全部</button></div>
+      </section>
+      <div id="connection-error" class="connection-error" role="status" aria-live="polite" hidden><span>暂时无法连接服务，正在等待恢复。</span><button class="panel-link" type="button" data-action="refresh-page">重新连接</button></div>
+      <div id="app">
+        <section class="loading-layout" aria-label="正在加载工作空间" aria-busy="true">
+          <span class="sr-only" role="status">正在加载工作空间。</span>
+          <div class="skeleton loading-summary" aria-hidden="true"></div>
+          <div class="loading-columns" aria-hidden="true"><div class="skeleton loading-chart"></div><div class="skeleton loading-chart"></div></div>
+          <div class="skeleton loading-table" aria-hidden="true"></div>
+        </section>
+      </div>
+      <footer class="workspace-footer"><span class="footer-brand">签到助手 <code id="app-version">待连接</code></span><div><button data-action="about" class="footer-link" type="button" aria-haspopup="dialog" aria-controls="modal">数据与运行说明</button></div></footer>
+    </main>
+  </div>
+</div>
+<dialog id="modal" aria-labelledby="dialog-title"><div id="modal-content"></div></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="/assets/app.js" defer></script>
+<script src="/assets/providers.js" defer></script>
+</body>
+</html>

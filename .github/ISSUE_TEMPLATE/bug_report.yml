@@ -1,0 +1,49 @@
+name: 问题反馈
+description: 报告签到助手的界面、账号流程或部署问题。
+title: '[Bug]: '
+body:
+  - type: markdown
+    attributes:
+      value: 请描述可复现的问题。日志和截图使用模拟数据，移除密码、Session、登录 Token、代理认证及其他账号凭据。
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 页面底部显示的版本，或当前提交编号。
+      placeholder: v1.0.8
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 部署方式
+      options:
+        - 1Panel
+        - Docker Compose
+        - 本地 Node.js
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 环境
+      description: 操作系统、CPU 架构、浏览器；本地运行时补充 Node.js 版本。
+      placeholder: Linux amd64、Chrome
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 说明具体页面、操作、期望结果和实际结果。
+      placeholder: |
+        1. 打开……
+        2. 填写或点击……
+        期望：……
+        实际：……
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误信息
+      description: 粘贴已去除账号凭据的相关日志，或附上使用演示数据的截图。
+      render: text

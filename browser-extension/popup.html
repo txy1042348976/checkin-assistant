@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>签到助手 · 浏览器连接</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="app-header"><img src="icons/48.png" alt="" width="36" height="36"><div><h1>签到助手</h1><p>在你的浏览器，连接你的账号。</p></div></header>
+  <main>
+    <section id="connect-screen">
+      <div class="step-label"><span>01</span> 连接自己的助手</div>
+      <h2>粘贴本次连接码</h2>
+      <p class="section-copy">在签到助手的授权进度中复制连接码，再粘贴到这里。每次连接只对应一个站点账号。</p>
+      <form id="connect-form">
+        <label for="connection-code">连接码</label>
+        <textarea id="connection-code" rows="4" maxlength="4096" spellcheck="false" autocomplete="off" placeholder="粘贴签到助手生成的完整连接码" required></textarea>
+        <button id="connect-button" type="submit" class="button primary">连接签到助手 <span aria-hidden="true">↗</span></button>
+      </form>
+      <p class="footnote">连接码仅临时保存在当前浏览器会话中，20 分钟内有效，完成导入后清除。</p>
+    </section>
+    <section id="import-screen" hidden>
+      <div class="step-label"><span>02</span> 导入当前站点</div>
+      <h2>先在原站完成登录</h2>
+      <div class="connection-summary"><div><span>目标站点</span><strong id="provider-name"></strong></div><div><span>保存到</span><strong id="assistant-address"></strong></div><div><span>账号备注</span><strong id="account-name"></strong></div></div>
+      <p class="section-copy">打开该站点，使用你要关联的账号登录。进入站点控制台后，保持该标签页处于当前页面，再点击下方导入。</p>
+      <button id="open-site" class="button secondary" type="button">打开原站登录页 <span aria-hidden="true">↗</span></button>
+      <form id="import-form">
+        <div id="oauth-option" class="oauth-option" hidden><label><input id="include-oauth" type="checkbox"><span>同时保存 <b id="oauth-name"></b> 登录状态，用于 AgentRouter 后台签到</span></label><p>会额外读取所选身份提供方的登录 Cookie，并发送到你自己的助手。仅当原站与身份提供方使用同一个账号时启用；此权限比只导入站点 Session 更广。</p></div>
+        <div class="destination-note"><img src="shield.svg" alt="" width="16" height="16"><span>当前站点的登录状态将加密保存在上方助手地址。导入会核对账号身份和余额。</span></div>
+        <button id="import-button" type="submit" class="button primary">导入登录状态 <span aria-hidden="true">→</span></button>
+      </form>
+      <div class="connection-controls"><span id="expiry-label"></span><button id="disconnect-button" type="button">断开连接</button></div>
+    </section>
+    <section id="done-screen" hidden>
+      <div class="success-mark" aria-hidden="true">✓</div><h2>登录状态已导入</h2><p id="done-copy" class="section-copy"></p><button id="open-assistant" class="button primary" type="button">返回签到助手 <span aria-hidden="true">↗</span></button><button id="new-connection" class="button text" type="button">连接另一个站点</button>
+    </section>
+    <p id="status-message" class="status-message" role="status" aria-live="polite" hidden></p>
+  </main>
+  <footer>本人登录 · 主动导入 · 你的服务器</footer>
+  <script type="module" src="popup.mjs"></script>
+</body>
+</html>

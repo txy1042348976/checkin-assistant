@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "签到助手 · 浏览器连接",
+  "version": "1.0.0",
+  "minimum_chrome_version": "114",
+  "description": "在你的浏览器完成站点登录，再主动将该站点登录状态导入自己的签到助手。",
+  "permissions": ["activeTab", "cookies", "scripting", "storage"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "background": {"service_worker": "background.mjs", "type": "module"},
+  "action": {"default_popup": "popup.html", "default_title": "签到助手 · 浏览器连接"},
+  "icons": {"16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png"},
+  "incognito": "not_allowed",
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'"}
+}

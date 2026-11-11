@@ -1,0 +1,38 @@
+name: checkin-assistant
+
+services:
+  checkin-assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: checkin-assistant:local
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "${CHECKIN_BIND_IP:-127.0.0.1}:${CHECKIN_PORT:-8765}:8765"
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Shanghai
+      CHECKIN_WEB_MODE: "1"
+      CHECKIN_BROWSER_NO_SANDBOX: "1"
+      CHECKIN_TIMEZONE: "${CHECKIN_TIMEZONE:-Asia/Shanghai}"
+      CHECKIN_DATA_DIR: /data
+      CHECKIN_BROWSER_PATH: /usr/bin/chromium
+      CHECKIN_ADMIN_USER: "${CHECKIN_ADMIN_USER:-}"
+      CHECKIN_ADMIN_PASSWORD: "${CHECKIN_ADMIN_PASSWORD:-}"
+      CHECKIN_PUBLIC_URL: "${CHECKIN_PUBLIC_URL:-}"
+      CHECKIN_MAX_CONCURRENT_RUNS: "${CHECKIN_MAX_CONCURRENT_RUNS:-1}"
+      CHECKIN_PROXY_URL: "${CHECKIN_PROXY_URL:-}"
+    volumes:
+      - ./data:/data
+    shm_size: 512mb
+    mem_limit: "${CHECKIN_MEMORY_LIMIT:-2g}"
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

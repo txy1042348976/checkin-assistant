@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+  CHECKIN_BROWSER_PATH: /usr/bin/google-chrome
+
+jobs:
+  verify:
+    name: Node.js 与网页回归
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - name: 安装锁定依赖
+        run: npm ci
+      - name: 构建与语法检查
+        run: |
+          npm run build
+          node --check web/app.js
+          node --check web/providers.js
+      - name: 严格检查源码与测试类型
+        run: >-
+          npx --no-install tsc --noEmit --target ES2023 --module NodeNext
+          --moduleResolution NodeNext --strict --esModuleInterop --skipLibCheck
+          server/*.ts tests-node/*.test.ts
+      - name: 后端与可选扩展回归
+        run: |
+          npm test
+          node --test browser-extension/tests/*.test.mjs
+      - name: 确认系统浏览器
+        run: |
+          test -x "$CHECKIN_BROWSER_PATH"
+          "$CHECKIN_BROWSER_PATH" --version
+      - name: 隔离网页与账号迁移回归
+        run: |
+          npm run test:ui -- --output build/test-ci-ui
+          npm run test:ui:accounts -- --output build/test-ci-account-transfer
+      - name: 保存网页验证报告
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: checkin-assistant-ui-verification
+          path: |
+            build/test-ci-ui/
+            build/test-ci-account-transfer/
+          if-no-files-found: warn
+          retention-days: 7
+
+  docker:
+    name: Docker 构建与持久化回归
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: 构建实际运行镜像
+        run: docker build -t checkin-assistant:ci .
+      - name: 验证容器、网页与重启持久化
+        run: >-
+          node tests-node/docker-smoke.mjs --image checkin-assistant:ci
+          --output build/test-ci-docker
+      - name: 保存容器验证报告
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: checkin-assistant-docker-verification
+          path: build/test-ci-docker/
+          if-no-files-found: warn
+          retention-days: 7
+
+  package:
+    name: 1Panel 源码包验证
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: 打包并解包核对源码
+        run: npm run package:web -- release
+      - name: 验证部署包校验值
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v5
+        with:
+          name: checkin-assistant-1panel
+          path: |
+            release/checkin-assistant-1panel.zip
+            release/checkin-assistant-1panel.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

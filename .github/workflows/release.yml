@@ -1,0 +1,76 @@
+name: Draft release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+jobs:
+  draft:
+    name: 构建 1Panel 包并创建发布草稿
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+      - name: 核对标签与应用版本
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const application = JSON.parse(readFileSync('package.json', 'utf8'));
+          assert.equal(process.env.RELEASE_TAG, `v${application.version}`, '标签必须与 package.json 的版本一致');
+          JS
+      - run: npm ci
+      - name: 构建并运行后端与可选扩展测试
+        run: |
+          npm run build
+          npm test
+          node --test browser-extension/tests/*.test.mjs
+      - name: 生成并验证部署源码包
+        run: |
+          npm run package:web -- release
+          (cd release && sha256sum --check SHA256SUMS)
+      - name: 准备发布说明
+        run: |
+          cat > release-notes.md <<'NOTES'
+          签到助手：可在 1Panel / Docker Compose 部署的网页签到与额度管理应用。
+
+          下载 `checkin-assistant-1panel.zip` 或 `.tar.gz`，解压后按包内 `docs/deploy-1panel.md` 构建部署。
+          首次访问设置登录账号和密码，站点账号支持手工填写与文件导入导出。
+          部署源码包不包含账号数据、数据库、密钥或本地环境配置。
+
+          `SHA256SUMS` 可用于核对下载文件；源码包内附逐文件校验清单。
+          NOTES
+      - name: 创建或更新发布草稿
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files=(release/checkin-assistant-1panel.zip release/checkin-assistant-1panel.tar.gz release/SHA256SUMS)
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            test "$draft" = true || { echo '已有正式发布；工作流只允许更新草稿。'; exit 1; }
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --draft --title "签到助手 ${RELEASE_TAG}" --notes-file release-notes.md
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" --draft --verify-tag \
+              --title "签到助手 ${RELEASE_TAG}" --notes-file release-notes.md
+          fi
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
