@@ -1,6 +1,6 @@
 # 签到助手验证说明
 
-本文件记录 **v1.0.8** 的本地验证结果、可复现流程与覆盖范围。测试使用临时安装、独立浏览器上下文和本地模拟站点，不读取日常浏览器凭据，也不对真实站点执行签到。
+本文件记录 **v1.0.8** 的本地与 GitHub CI 验证结果、可复现流程与覆盖范围。测试使用临时安装、独立浏览器上下文和本地模拟站点，不读取日常浏览器凭据，也不对真实站点执行签到。
 
 ## 本次验证记录
 
@@ -18,7 +18,9 @@
 
 两套网页回归记录的 JavaScript 错误和外站异常均为 **0**。README 的桌面概览、手机概览与首次设置图片已更新为本次 v1.0.8 的模拟账号截图。
 
-Docker 最终源码镜像的验收结果见下文。本次未运行 GitHub Actions 工作流。
+最终本地网页报告位于 `build/test-queue-after/report.json`，账号专项报告位于 `build/test-queue-accounts/report.json`。后端与扩展结果沿用同日已完成的回归；本次焦点修复未修改业务逻辑。
+
+Docker 最终源码镜像与 Linux x64 GitHub CI 的验收结果见下文。
 
 ## 环境
 
@@ -54,11 +56,15 @@ node --test browser-extension/tests/*.test.mjs
 ## 网页 UI / API
 
 ```bash
-npm run test:ui -- --output build/test-opensource-ui
-npm run test:ui:accounts -- --output build/test-opensource-accounts
+npm run test:ui -- --output build/test-queue-after
+npm run test:ui:accounts -- --output build/test-queue-accounts
 ```
 
 基础网页检查覆盖首次空白表单、字段与密码确认校验、创建后进入控制台、过时创建页返回普通登录，以及错误账号和密码拒绝。继续检查账号及站点管理、额度单位、概览分布、快捷操作、定时设置、日志与 CSV，包含桌面和手机布局、键盘导航及弹窗取消。
+
+弹窗打开期间，工作区真实 DOM 刷新不会夺走弹窗内的焦点；关闭弹窗后再次刷新，仍保留已恢复的控件焦点。
+
+连接轮询状态不变时，取消控件的 DOM 节点与焦点保持不变。
 
 账号文件专项覆盖密码加密和普通 JSON 下载、当前筛选范围、错误密码与文件格式、重复和无效预览、丢失响应后的安全重试、取消与迟到响应处理，以及手机长预览和操作按钮。该专项不请求原站登录、余额或签到。
 
@@ -66,10 +72,10 @@ npm run test:ui:accounts -- --output build/test-opensource-accounts
 
 ## Docker 镜像
 
-**2026-11-11** 的最终源码镜像验收通过。容器运行环境为 **Linux arm64、Node.js v24.22.2、Chromium 156.0.8078.79**，验收镜像为 `checkin-assistant:opensource-test`，本次构建的镜像 ID 为：
+**2026-11-11** 的最终源码镜像验收通过。容器运行环境为 **Linux arm64、Node.js v24.22.2、Chromium 156.0.8078.79**，验收镜像为 `checkin-assistant:queue-final`，本次构建的镜像 ID 为：
 
 ```text
-sha256:d9532f9b0ed55b69c0cd155ba65f4707f749e0e8db98d2cb25bb093199748424
+sha256:56f485247ab58c3cd2fa53432a3aeb82dc9a449f6498ca83c4c3709b26295b0b
 ```
 
 | 检查 | 结果 |
@@ -81,7 +87,7 @@ sha256:d9532f9b0ed55b69c0cd155ba65f4707f749e0e8db98d2cb25bb093199748424
 | 账号专项的外部业务请求 | 0 |
 | 临时容器与数据清理 | `cleanup_errors: []` |
 
-本次报告位于 `build/test-opensource-docker-final/report.json`，网页和账号专项截图分别位于同目录的 `ui/` 与 `account-transfer-ui/`。这些报告和截图是本地验证产物，不随源码部署包分发。
+本次报告位于 `build/test-queue-docker/report.json`，网页和账号专项截图分别位于同目录的 `ui/` 与 `account-transfer-ui/`。这些报告和截图是本地验证产物，不随源码部署包分发。
 
 复现命令：
 
@@ -89,7 +95,7 @@ sha256:d9532f9b0ed55b69c0cd155ba65f4707f749e0e8db98d2cb25bb093199748424
 docker build -t checkin-assistant:test .
 node tests-node/docker-smoke.mjs \
   --image checkin-assistant:test \
-  --output build/test-opensource-docker
+  --output build/test-queue-docker
 ```
 
 镜像验收检查生产入口、Node.js 健康检查、非 root 应用与 Chromium、私有数据文件权限及运行时资源一致性。在空数据卷验证无管理员的首次设置，并在容器重启后核对账号、管理员、密码、会话、密钥、记录和待导入状态。重复设置应返回 `409`，不覆盖凭据或签发会话。
@@ -106,8 +112,18 @@ npm run package:web -- ./release
 
 打包脚本生成 ZIP、tar.gz 和 `SHA256SUMS`，解包后逐文件核对字节、源码清单与入口权限。部署包包含运行和构建源码，不包含 `.env`、数据库、密钥、依赖目录或测试生成的数据。
 
+## GitHub CI
+
+**2026-11-11**，[GitHub CI 运行 42972396633](https://github.com/txy1042348976/checkin-assistant/actions/runs/42972396633) 对应源码提交 `8ada716`，`verify`、`docker` 与 `package` 三个任务均通过。Runner 为 **Ubuntu 26.04.1、Linux amd64（x64）**；源码测试与 CI 镜像均使用 **Node.js v24.22.2**，Runner Chrome 和镜像 Chromium 均为 **156.0.8078.79**。
+
+| 任务 | 结果 |
+|---|---|
+| `verify` | 后端 181 项、扩展 20 项、UI 22 项与账号专项 11 项全部通过；网页分别生成 21 与 9 张截图 |
+| `docker` | 12 项容器检查通过；UI 22 项与账号专项 11 项全部通过，合计生成 30 张截图 |
+| `package` | 116 个源码文件，ZIP 与 tar.gz 的解包、逐文件核对和 SHA-256 校验通过 |
+
 ## 验证边界
 
 本地模拟测试验证应用的校验、保存、任务、取消和持久化行为。实际站点的网络、WAF、凭据有效期和人工验证码可能改变运行结果；应用以当次站点响应记录成功、同步、失败或奖励未知。
 
-上述结果覆盖本次 macOS arm64 本地安装及 Linux arm64 容器，其他 CPU 架构、浏览器和服务器环境尚未据此完成验收。各次验证的环境、版本和通过数量应以该次生成的报告为准；GitHub Actions 的实际运行结果需另行核对。
+上述已通过结果覆盖本次 macOS arm64 本地安装、Linux arm64 容器与 Linux x64 GitHub CI。其他 CPU 架构、浏览器和服务器环境尚未据此完成验收，各次验证的环境、版本和通过数量应以该次生成的报告为准。
