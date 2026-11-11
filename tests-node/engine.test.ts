@@ -277,7 +277,9 @@ for (const method of ['linuxdo', 'github'] as const) test(`Agent ${method} uses 
 for (const checked of [false, undefined]) test(`Agent fresh login without a true check-in flag remains synced (${checked})`, { skip: !chromePath }, async t => {
   const f = await browserFixture(t, { checked });
   const result = await f.engine.run(row('agentrouter', { login_via: 'linuxdo' }), credentials({ oauth_cookies: [f.upstream] }));
-  assert.equal(result.status, 'synced'); assert.equal(result.after_balance, 52); assert.equal(result.reward, checked === false ? 0 : null);
+  assert.equal(result.status, 'synced', JSON.stringify({ message: result.message, duration_ms: result.duration_ms,
+    paths: f.paths.map(({ origin, path, method }) => ({ origin, path, method })) }));
+  assert.equal(result.after_balance, 52); assert.equal(result.reward, checked === false ? 0 : null);
 });
 
 test('Agent confirmed login without post-login money saves new session and keeps old database amounts', { skip: !chromePath }, async t => {
