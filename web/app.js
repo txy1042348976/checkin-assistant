@@ -98,8 +98,23 @@ function logsView(){
  return `<div class="toolbar"><span class="panel-sub">最近 ${all.length} 条运行记录</span><div class="filter-group" aria-label="按结果筛选日志">${[['all','全部'],['success','签到成功'],['synced','余额同步'],['manual_required','需要处理'],['failed','失败']].map(([value,label])=>`<button class="filter ${state.logFilter===value?'active':''}" data-log-filter="${value}" aria-pressed="${state.logFilter===value}">${label}</button>`).join('')}</div></div>
  <section class="panel logs-panel"><div class="panel-head"><div><h2 class="panel-title">运行记录</h2><p class="panel-sub">签到与余额同步分别记录</p></div><button class="button secondary small" data-action="export">${icon('download')}导出 CSV</button></div><div class="table-wrap"><table class="account-table"><thead><tr><th scope="col">运行时间</th><th scope="col">账号 / 平台</th><th scope="col" class="hide-mobile">触发方式</th><th scope="col">结果</th><th scope="col">新增额度</th><th scope="col" class="hide-medium">站点说明</th><th scope="col"><span class="sr-only">详情</span></th></tr></thead><tbody>${runs.length?runs.map(r=>`<tr><td>${timeLabel(r.started_at,true)}</td><td><div class="account-name"><span>${esc(r.account_name)}<small>${providerName(r.provider)}</small></span></div></td><td class="hide-mobile">${r.trigger==='manual'?'手动':'定时'}</td><td>${statusBadge(r.status)}</td><td class="balance ${r.reward>0?'success-text':''}">${r.reward==null?'<span class="unknown-money">奖励未知</span>':(r.reward>0?'+':'')+money(r.reward,r.currency)}</td><td class="log-message hide-medium">${esc(r.message)}</td><td><button class="icon-button" data-action="log" data-id="${r.id}" aria-label="查看 ${esc(r.account_name)} 运行详情">${icon('chevron')}</button></td></tr>`).join(''):`<tr><td colspan="7" class="empty-row"><div class="empty-state"><div class="empty-illustration">${icon('list')}</div><b>${state.logFilter==='all'?'等待第一次运行':'没有对应的运行记录'}</b><p>每次运行都会记录结果，金额未知时也会明确标记。</p></div></td></tr>`}</tbody></table></div></section>`;
 }
+function rememberFocus(element){
+ if(!(element instanceof HTMLElement))return null;
+ const app=$('#app');
+ if(!app.contains(element))return {element};
+ const attributes=['data-action','data-id','data-site','data-view','data-filter','data-log-filter'].filter(name=>element.hasAttribute(name));
+ if(!attributes.length&&element.hasAttribute('aria-label'))attributes.push('aria-label');
+ const control=element.id?`#${CSS.escape(element.id)}`:attributes.length?element.localName+attributes.map(name=>`[${name}="${CSS.escape(element.getAttribute(name))}"]`).join(''):null;
+ const selector=control&&element.closest('.quick-panel')?`.quick-panel ${control}`:control;
+ return {element,selector,index:selector?$$(selector,app).indexOf(element):-1,view:app.dataset.view};
+}
+function restoreFocus(bookmark){
+ const element=bookmark?.element?.isConnected?bookmark.element:bookmark?.selector&&bookmark.view===state.view?$$(bookmark.selector,$('#app'))[bookmark.index]:null;
+ if(element instanceof HTMLElement&&!element.matches(':disabled')&&element.getClientRects().length)element.focus({preventScroll:true});
+}
 function render(){
  if(!state.data)return;
+ const focused=$('#app').contains(document.activeElement)?rememberFocus(document.activeElement):null;
  const searchFocused=document.activeElement?.id==='account-search',searchPosition=searchFocused?document.activeElement.selectionStart:null;
  const scroller=$('#overview-accounts'),saved=scroller?{top:scroller.scrollTop,left:scroller.scrollLeft,focused:document.activeElement===scroller}:null;
  const views={overview:['概览','签到概览','你的站点额度、今日进度与下一次运行。'],accounts:['账号','账号管理','集中管理站点凭据、余额与自动运行。'],sites:['站点','站点管理','连接 AnyRouter、AgentRouter 和你常用的兼容站点。'],logs:['运行日志','运行日志','查看签到结果、额度变化与需要处理的任务。']};
@@ -110,14 +125,16 @@ function render(){
  $('#admin-button').hidden=!state.data.web?.enabled;
  if(state.auth?.username){$('#user-name').textContent=state.auth.username;$('#user-avatar').textContent=state.auth.username.slice(0,1).toUpperCase();}
  $('#app').innerHTML=state.view==='overview'?overview():state.view==='accounts'?accountsView():state.view==='sites'?sitesView():logsView();
+ $('#app').dataset.view=state.view;
  const current=$('#overview-accounts');
  if(current&&saved){current.scrollTop=saved.top;current.scrollLeft=saved.left;if(saved.focused)current.focus({preventScroll:true});}
+ restoreFocus(focused);
  if(searchFocused){const search=$('#account-search');if(search){search.focus({preventScroll:true});search.setSelectionRange(searchPosition,searchPosition);}}
 }
 function modal(content,{destructive=false}={}){
  disposeAccountTransfer();
  const dialog=$('#modal');
- if(!dialog.open)modalTrigger=document.activeElement;
+ if(!dialog.open)modalTrigger=rememberFocus(document.activeElement);
  $('#modal-content').innerHTML=content;
  const heading=$('#modal-content h2');if(heading)heading.id='dialog-title';
  const description=$('#modal-content .modal-head p');
@@ -144,7 +161,7 @@ function closeModal(){
   const accountForm=$('#account-form');if(accountForm){accountForm.reset();credentialRequests.delete(accountForm);}
   state.loginSession=null;
   $('#modal').close();
-  if(modalTrigger?.isConnected)modalTrigger.focus({preventScroll:true});
+  restoreFocus(modalTrigger);
   modalTrigger=null;
   state.editing=null;
   state.connecting=null;

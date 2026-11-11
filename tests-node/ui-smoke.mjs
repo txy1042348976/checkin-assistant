@@ -546,9 +546,19 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
         const trigger = page.locator(`.quick-panel [data-action="${action}"]`);
         assert.equal(await trigger.isEnabled(), true, `${action}: shortcut is available`);
         await trigger.click(); await visible(form);
+        const beforeCancelRefresh = await trigger.elementHandle();
+        await page.evaluate(() => refresh(true));
+        await until(() => beforeCancelRefresh.evaluate(element => !element.isConnected), `${action}: workspace refreshed with dialog open`);
+        await beforeCancelRefresh.dispose();
+        await visible(form);
         await page.locator('#modal').getByRole('button', {name: '取消', exact: true}).click();
         await page.locator('#modal').waitFor({state: 'hidden'});
         assert.equal(await trigger.evaluate(element => document.activeElement === element), true, `${action}: cancel restores shortcut focus`);
+        const beforeFocusRefresh = await trigger.elementHandle();
+        await page.evaluate(() => refresh(true));
+        await until(() => beforeFocusRefresh.evaluate(element => !element.isConnected), `${action}: workspace refreshed with shortcut focused`);
+        await beforeFocusRefresh.dispose();
+        assert.equal(await trigger.evaluate(element => document.activeElement === element), true, `${action}: refresh preserves shortcut focus`);
       }
       await page.locator('.quick-panel [data-view="logs"]').click();
       await visible('.logs-panel'); assert.equal(new URL(page.url()).hash, '#logs');
