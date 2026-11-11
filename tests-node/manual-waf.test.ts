@@ -8,6 +8,7 @@ import test, { type TestContext } from 'node:test';
 import { chromium } from 'playwright-core';
 import type { Browser, BrowserContext, BrowserContextOptions, LaunchOptions } from 'playwright-core';
 import { detectBrowser, loadConfig } from '../server/config.js';
+import { BrowserSession } from '../server/engine.js';
 import { HttpError } from '../server/errors.js';
 import { UserBrowserImports } from '../server/imports.js';
 import { PROVIDERS } from '../server/providers.js';
@@ -67,6 +68,32 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   if (options.wafDisabled === 'method') provider.bypass_method = null;
   if (options.wafDisabled === 'names') provider.waf_cookie_names = [];
   const observed: ObservedRequest[] = [];
+  const browserEvents: Record<string, unknown>[] = [];
+  for (const phase of ['start', 'navigate', 'request', 'session'] as const) {
+    const original = BrowserSession.prototype[phase];
+    t.mock.method(BrowserSession.prototype, phase, async function(this: BrowserSession, ...args: unknown[]) {
+      const started = Date.now();
+      const pathname = ['navigate', 'request'].includes(phase) && typeof args[0] === 'string'
+        ? new URL(args[0], provider.domain).pathname : undefined;
+      browserEvents.push({ phase, path: pathname, event: 'started' });
+      try {
+        const result: unknown = await Reflect.apply(original, this, args);
+        browserEvents.push({ phase, path: pathname, event: 'finished', duration_ms: Date.now() - started });
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '', name = error instanceof Error ? error.name : 'UnknownError';
+        const diagnostic = { phase, path: pathname, event: 'failed', duration_ms: Date.now() - started,
+          error_type: ['Error', 'TimeoutError', 'TransportError', 'HttpError', 'PreflightError', 'AssertionError',
+            'TypeError', 'RangeError'].includes(name) ? name : 'UnknownError',
+          navigation: /navigation|net::ERR_ABORTED|frame was detached/i.test(message),
+          context_destroyed: /execution context was destroyed|cannot find context/i.test(message),
+          closed: /target.*closed|page.*closed|browser.*closed/i.test(message),
+          timeout: /timeout|timed out/i.test(message) };
+        browserEvents.push(diagnostic); t.diagnostic(JSON.stringify(diagnostic));
+        throw error;
+      }
+    });
+  }
   const browsers: Browser[] = [];
   const contexts: BrowserContext[] = [];
   const added: Parameters<BrowserContext['addCookies']>[0][] = [];
@@ -165,6 +192,8 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   const input = { provider: 'anyrouter', method: 'manual' as const, name: '本地 WAF 手填账号', interval_hours: 6,
     origin: provider.domain, proxy: { mode: 'direct' as const } };
   return { provider, store, imports, input, observed, browsers, contexts, added, closes,
+    diagnostics: () => ({ browser_events: browserEvents, browser_count: browsers.length, context_count: contexts.length,
+      requests: observed.map(({ path, method, raw, fresh }) => ({ path, method, raw, fresh })) }),
     freshStarted: freshStarted.promise, disconnected: disconnected.promise, get freshResponses() { return freshResponses; } };
 }
 
@@ -186,7 +215,10 @@ function assertClosed(f: Awaited<ReturnType<typeof fixture>>) {
 
 test('manual Any Session and ID survive a WAF HTML challenge using a temporary read-only browser', { skip: !chromePath }, async t => {
   const f = await fixture(t);
-  const result = await f.imports.importManual(f.input, payload(), '1'.repeat(32));
+  const result = await f.imports.importManual(f.input, payload(), '1'.repeat(32)).catch(error => {
+    t.diagnostic(JSON.stringify(f.diagnostics()));
+    throw error;
+  });
   assert.equal(result.status, 'success'); assert.equal(f.store.accounts().length, 1);
   const row = f.store.account(result.account_id!)!;
   assert.equal(row.balance, 50); assert.equal(row.used_quota, 10); assert.equal(row.total_quota, 60);

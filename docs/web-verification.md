@@ -79,10 +79,10 @@ node --test browser-extension/tests/*.test.mjs
 
 1. Session 换行、空值、非法用户 ID 等输入返回字段错误，并且不保存账号、不请求原站。
 2. 格式正确的 Session、登录 Token 与账号密码直接加密保存，新账号余额为待同步；保存阶段没有原站请求。
-3. Session / Token 保存使用相同请求标识和内容重试时，不重复添加账号；同一标识换成其他内容返回冲突。
+3. Session / Token 保存请求在 20 分钟有效期内使用相同标识和内容重试时，不重复添加账号；同一标识换成其他内容返回冲突。该请求标识仅用于 Session / Token 保存，账号密码采用普通 POST 保存。
 4. 看似格式合法但站点已不接受的 Session 也能先保存；首次任务运行时才报告凭据问题，不产生虚假的余额或奖励。
 5. 首次任务验证用户身份与余额；身份不一致或请求失败时不覆盖已有有效余额。AgentRouter Session 成功查询记录为余额同步，奖励保持未知。
-6. `/api/login/*` 与 `/api/browser-import/*` 返回 `410`；`/api/bootstrap` 的 `authorization` 为 `null`。
+6. `/api/login/*`、`/api/browser-import/*` 与 `/downloads/checkin-assistant-browser-extension.zip` 返回 `410`；`/api/bootstrap` 的 `authorization` 为 `null`。
 
 ## 网页 UI / API
 
@@ -129,7 +129,7 @@ node tests-node/docker-smoke.mjs \
   --output build/test-v109-docker
 ```
 
-镜像验收检查生产入口、Node.js 健康检查、非 root 应用与 Chromium、私有数据文件权限及运行时资源一致性。在空数据卷验证无管理员的首次设置，并在容器重启后核对账号、管理员、密码、会话、密钥和记录。用于手动保存的 nonce 在重启后持续有效，同一请求仍可幂等重放；`/api/bootstrap` 的 `authorization` 保持为 `null`。重复设置返回 `409`，不覆盖凭据或签发会话。
+镜像验收检查生产入口、Node.js 健康检查、非 root 应用与 Chromium、私有数据文件权限及运行时资源一致性。在空数据卷验证无管理员的首次设置，并在容器重启后核对账号、管理员、密码、会话、密钥和记录。用于 Session / Token 手动保存的 nonce 在原有 20 分钟有效期内跨重启保留，同一请求仍可幂等重放；`/api/bootstrap` 的 `authorization` 保持为 `null`。重复设置返回 `409`，不覆盖凭据或签发会话。
 
 同一镜像另运行基础网页和账号文件专项；生产配置检查使用隔离实例，确认测试站点覆盖不会进入生产配置。临时容器与数据已清理，报告中的 `cleanup_errors` 为空。
 
