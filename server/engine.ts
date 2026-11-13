@@ -772,8 +772,19 @@ export class CheckinEngine {
         }
       }
       let id = profileId(credentials.api_user), loginChecked: boolean | undefined, pendingUpdate: Partial<Credentials> | undefined;
+      let agentLoginBefore: Snapshot | undefined;
       if (row.auth_mode === 'password') {
         if (typeof credentials.email !== 'string' || !credentials.email || typeof credentials.password !== 'string' || !credentials.password) return { ...result, status: 'manual_required', message: '账号密码信息不完整，请编辑账号或使用自己的浏览器重新授权。' };
+        if (provider.name === 'agentrouter' && id && secret(credentials.session) && client instanceof BrowserSession && client.context) {
+          const host = new URL(provider.domain).hostname;
+          try {
+            await client.context.addCookies([{ name: 'session', value: credentials.session, domain: host, path: '/' }]);
+            const live = await readProfile(client, provider, id);
+            if (!live.kind) agentLoginBefore = live.snapshot;
+          } catch { /* An expired or unavailable saved Session must not block password login. */ }
+          try { await client.context.clearCookies({ name: 'session', domain: host }); }
+          catch { return { ...result, status: 'manual_required', message: '无法安全清除旧登录状态，本次未提交账号密码登录；请重新运行。' }; }
+        }
         submitted = true;
         const login = await client.request(provider.login_api_path, null, 'POST', { [isSub2API(provider) ? 'email' : 'username']: credentials.email, password: credentials.password }, false);
         const data = login.status === 200 && !guardedResponse(login) ? responseData(login.body, provider) : null;
@@ -834,8 +845,20 @@ export class CheckinEngine {
           result.status = loginChecked === true ? 'success' : 'synced';
           result.message = loginChecked === true ? 'AgentRouter 本次登录确认签到成功。' : loginChecked === false ? 'AgentRouter 本次登录未发放签到奖励。' : 'AgentRouter 登录完成，未返回签到确认标记。';
           delete result.before_balance;
+          if (agentLoginBefore) result.before_balance = agentLoginBefore.balance;
           if (loginChecked === false) result.reward = 0;
-          else if (loginChecked === true) result.message += ' 缺少登录前实时余额，奖励金额暂未确认。';
+          else if (loginChecked === true) {
+            if (!agentLoginBefore || agentLoginBefore.total === null || snapshot.total === null) {
+              result.message += ' 缺少签到前实时额度快照，奖励金额暂未确认。';
+            } else {
+              const increase = roundAmount(snapshot.total - agentLoginBefore.total);
+              if (increase >= 0) {
+                result.reward = increase;
+                const unit = { USD: '$', CNY: '¥', credits: '积分 ' }[provider.currency];
+                result.message += ` 本次额度增加 ${unit}${increase.toFixed(2)}。`;
+              } else result.message += ' 当前总额度低于上次已验证快照，奖励金额暂未确认。';
+            }
+          }
         } else if (provider.name === 'agentrouter' && row.auth_mode === 'session') {
           if (upstream.length && method && browser) {
             const fresh = await this.agentLogin(browser, method, id, credentials, snapshot); submitted ||= browser.oauth?.submitted ?? false;
