@@ -105,12 +105,16 @@ test('legacy SQLite database keeps account identity, Fernet secrets and scheduli
   assert.deepEqual(store.settings(), { scheduler_enabled: false, interval_hours: 12 });
   assert.equal(store.runs()[0].currency, 'USD'); assert.equal(store.runs()[0].status, 'not_run');
   assert.equal(store.db.prepare('SELECT status FROM runs WHERE id=1').get()!.status, 'vip_required');
+  assert.match(String(store.db.prepare('EXPLAIN QUERY PLAN SELECT 1 FROM runs WHERE provider=? LIMIT 1').get('anyrouter')!.detail), /USING COVERING INDEX runs_provider/);
+  assert.equal(store.db.prepare('SELECT count(*) AS count FROM runs INDEXED BY runs_started_at_jd WHERE julianday(started_at)>=julianday(?)')
+    .get('2026-11-01T08:00:00+08:00')!.count, 1);
   assert.equal(readFileSync(store.keyPath, 'utf8'), FERNET_KEY);
   store.close();
   const restarted = new Store({ dataDir: directory, providers, timezone: 'Asia/Shanghai' });
   t.after(() => restarted.close());
   assert.equal(restarted.accounts().length, 1); assert.equal(restarted.credentials(restarted.account(1)!).session, 'fixture-python-session');
   assert.equal(restarted.addAccount({ name: 'new', provider: 'agentrouter', auth_mode: 'session', enabled: true, interval_hours: 6, session: 'new-private', api_user: '8' }), 2);
+  assert.equal(restarted.db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type='index' AND name IN ('runs_started_at_jd','runs_provider')").get()!.count, 2);
 });
 
 test('data files restrict permissions and an existing database never gets a replacement encryption key', t => {
@@ -311,13 +315,85 @@ test('seven-day calendar includes every run beyond the 100-row log window and gr
   assert.deepEqual(dashboard.trends.USD, dashboard.trend);
 });
 
+test('dashboard range scan excludes old history while keeping offset boundaries and the full recent calendar', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-10T16:15:00Z') });
+  const f = fixture(t), id = f.add();
+  const insert = f.store.db.prepare('INSERT INTO runs(account_id,account_name,provider,status,trigger_type,started_at,reward,currency) VALUES(?,?,?,?,?,?,?,?)');
+  f.store.transaction(() => {
+    for (let index = 0; index < 20_000; index++) insert.run(id, 'old fixture', 'anyrouter', 'success', 'scheduled', '2025-11-10T16:01:00+00:00', 1000, 'EUR');
+    insert.run(id, 'outside boundary', 'anyrouter', 'success', 'scheduled', '2026-11-03T00:14:59+08:00', 1000, 'EUR');
+    insert.run(id, 'inclusive boundary', 'anyrouter', 'success', 'scheduled', '2026-11-03T00:15:00+08:00', 1000, 'CNY');
+    for (let index = 0; index < 140; index++) insert.run(id, 'recent fixture', 'anyrouter', 'success', 'scheduled', '2026-11-11T00:01:00+08:00', 0.25, 'USD');
+  });
+  const statements: string[] = [], prepare = f.store.db.prepare.bind(f.store.db);
+  t.mock.method(f.store.db, 'prepare', (sql: string) => { statements.push(sql); return prepare(sql); });
+  const dashboard = f.store.dashboard();
+  assert.deepEqual(dashboard.stats, { balance: null, today_reward: 35, today_completed: 1, total_accounts: 1 });
+  assert.equal(dashboard.runs.length, 100);
+  assert.deepEqual(dashboard.runs.map(run => run.id), Array.from({ length: 100 }, (_, index) => 20_142 - index));
+  assert.deepEqual(dashboard.trend[6], { date: '11-11', reward: 35, runs: 140 });
+  assert.equal(dashboard.trend.reduce((sum, point) => sum + point.runs, 0), 140);
+  assert.deepEqual(Object.keys(dashboard.amounts), ['CNY', 'USD']);
+  assert.deepEqual(dashboard.amounts.CNY, { balance: null, today_reward: 0 });
+  assert.ok(dashboard.trends.CNY.every(point => point.reward === 0 && point.runs === 0));
+  const rangeSql = statements.find(sql => sql.includes('julianday(started_at)'));
+  assert.ok(rangeSql, 'dashboard must issue its bounded history query');
+  const plan = prepare('EXPLAIN QUERY PLAN ' + rangeSql).all('2026-11-02T16:15:00+00:00').map(row => String(row.detail)).join('\n');
+  assert.match(plan, /SEARCH runs USING INDEX runs_started_at_jd/);
+  assert.doesNotMatch(plan, /SCAN runs/);
+});
+
+test('dashboard preserves descending insertion order when rounding cancellation-sensitive rewards', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-11T12:00:00Z') });
+  const f = fixture(t, 'UTC'), id = f.add();
+  const insert = f.store.db.prepare('INSERT INTO runs(account_id,account_name,provider,status,trigger_type,started_at,reward,currency) VALUES(?,?,?,?,?,?,?,?)');
+  insert.run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-11T00:00:01Z', 1e16, 'USD');
+  insert.run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-11T00:00:02Z', -1e16, 'USD');
+  insert.run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-11T00:00:03Z', 1, 'USD');
+  const dashboard = f.store.dashboard();
+  assert.deepEqual(dashboard.runs.map(run => run.reward), [1, -1e16, 1e16]);
+  assert.equal(dashboard.stats.today_reward, 0);
+  assert.equal(dashboard.amounts.USD.today_reward, 0);
+  assert.deepEqual(dashboard.trends.USD[6], { date: '11-11', reward: 0, runs: 3 });
+  assert.deepEqual(dashboard.trend[6], { date: '11-11', reward: 0, runs: 3 });
+});
+
+test('calendar buckets match equal offset instants and keep credit units and deleted-account completion distinct', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-10T16:15:00Z') });
+  const f = fixture(t), first = f.add(), removed = f.add({ provider: 'agentrouter' });
+  f.providers.creditA = { ...f.providers.anyrouter, currency: 'credits' };
+  f.providers.creditB = { ...f.providers.anyrouter, currency: 'credits' };
+  const creditA = f.add({ provider: 'creditA' }), creditB = f.add({ provider: 'creditB' });
+  assert.equal(f.store.deleteAccount(removed), true);
+  const insert = f.store.db.prepare('INSERT INTO runs(account_id,account_name,provider,status,trigger_type,started_at,reward,currency) VALUES(?,?,?,?,?,?,?,?)');
+  insert.run(first, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-10T16:05:00+00:00', 1, 'USD');
+  insert.run(first, 'fixture', 'anyrouter', 'already_checked', 'manual', '2026-11-11T00:05:00+08:00', 2, 'USD');
+  insert.run(removed, 'deleted fixture', 'agentrouter', 'synced', 'manual', '2026-11-10T12:05:00-04:00', null, 'USD');
+  insert.run(null, 'legacy fixture', 'anyrouter', 'success', 'manual', '2026-11-11T00:05:00+08:00', 3, 'USD');
+  insert.run(first, 'fixture', 'anyrouter', 'failed', 'manual', '2026-11-10T23:59:59+08:00', 4, 'USD');
+  insert.run(creditA, 'credit A', 'creditA', 'success', 'manual', '2026-11-11T00:05:00+08:00', 100, 'credits');
+  insert.run(creditB, 'credit B', 'creditB', 'success', 'manual', '2026-11-11T00:05:00+08:00', 2, 'credits');
+  const dashboard = f.store.dashboard();
+  assert.equal(dashboard.stats.today_completed, 4);
+  assert.equal(dashboard.stats.today_reward, 6);
+  assert.equal(dashboard.stats.balance, null);
+  assert.deepEqual(dashboard.trend[5], { date: '11-10', reward: 4, runs: 1 });
+  assert.deepEqual(dashboard.trend[6], { date: '11-11', reward: 6, runs: 6 });
+  assert.deepEqual(dashboard.trends.USD[6], { date: '11-11', reward: 6, runs: 4 });
+  assert.deepEqual(dashboard.amounts['credits:creditA'], { balance: null, today_reward: 100 });
+  assert.deepEqual(dashboard.amounts['credits:creditB'], { balance: null, today_reward: 2 });
+});
+
 test('timezone calendars remain seven distinct dates across a daylight-saving transition', t => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-02T07:30:00Z') });
   const f = fixture(t, 'America/Los_Angeles'), id = f.add();
-  f.store.db.prepare('INSERT INTO runs(account_id,account_name,provider,status,trigger_type,started_at,reward,currency) VALUES(?,?,?,?,?,?,?,?)')
-    .run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-01T09:30:00+00:00', 1, 'USD');
-  assert.deepEqual(f.store.dashboard().trend.map(point => point.date), ['10-26', '10-27', '10-28', '10-29', '10-30', '10-31', '11-01']);
-  assert.equal(f.store.dashboard().stats.today_reward, 1);
+  const insert = f.store.db.prepare('INSERT INTO runs(account_id,account_name,provider,status,trigger_type,started_at,reward,currency) VALUES(?,?,?,?,?,?,?,?)');
+  insert.run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-01T01:30:00-07:00', 1, 'USD');
+  insert.run(id, 'fixture', 'anyrouter', 'success', 'manual', '2026-11-01T01:30:00-08:00', 2, 'USD');
+  const dashboard = f.store.dashboard();
+  assert.deepEqual(dashboard.trend.map(point => point.date), ['10-26', '10-27', '10-28', '10-29', '10-30', '10-31', '11-01']);
+  assert.deepEqual(dashboard.trend[6], { date: '11-01', reward: 3, runs: 2 });
+  assert.equal(dashboard.stats.today_reward, 3);
 });
 
 test('money rounding preserves Python ties-to-even, negative zero and seconds-only UTC timestamps', () => {

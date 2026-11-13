@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { chromium } from 'playwright-core';
 import { loadConfig } from '../server/config.js';
 import { createApp } from '../server/main.js';
 import { PROVIDERS } from '../server/providers.js';
@@ -13,15 +14,18 @@ const BODY = { name: '手填账号', provider: 'anyrouter', session: SESSION, ap
 
 async function fixture(t: test.TestContext) {
   const observed: { method: string; path: string; cookie: string; user: string }[] = [];
-  const state = { delay: 0 };
+  const state = { delay: 0, browserLaunches: 0, checked: false };
+  t.mock.method(chromium, 'launch', async () => { state.browserLaunches++; throw new Error('API fixture must not launch Chromium'); });
   const site = createServer((request, response) => {
     const endpoint = new URL(request.url!, 'http://127.0.0.1').pathname;
     observed.push({ method: request.method!, path: endpoint, cookie: request.headers.cookie || '', user: String(request.headers['new-api-user'] || '') });
-    const status = request.method !== 'GET' || endpoint !== '/api/user/self' ? 404
-      : request.headers.cookie?.includes('invalid-fixture-session') ? 401 : 200;
+    const expired = request.headers.cookie?.includes('invalid-fixture-session');
+    const checking = request.method === 'POST' && endpoint === '/api/user/sign_in';
+    const status = expired ? 401 : checking || request.method === 'GET' && endpoint === '/api/user/self' ? 200 : 404;
+    if (checking && status === 200) state.checked = true;
     setTimeout(() => {
       response.writeHead(status, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(status === 200 ? { success: true, data: { id: 7, username: 'fixture', quota: 25_000_000, used_quota: 0 } }
+      response.end(JSON.stringify(status === 200 ? { success: true, data: { id: 7, username: 'fixture', quota: state.checked ? 26_000_000 : 25_000_000, used_quota: 0 } }
         : { success: false, message: 'fixture-rejected' }));
     }, state.delay);
   });
@@ -30,7 +34,7 @@ async function fixture(t: test.TestContext) {
   const directory = mkdtempSync(path.join(tmpdir(), 'checkin-manual-import-api-')); mkdirSync(path.join(directory, 'data'));
   const providers = structuredClone(PROVIDERS); providers.anyrouter.domain = `http://127.0.0.1:${siteAddress.port}`;
   const runtime = await createApp({ providers, startScheduler: false,
-    config: loadConfig({}, { dataDir: path.join(directory, 'data'), adminPassword: 'Fixture-Secure-2026!', testMode: true }) });
+    config: loadConfig({}, { dataDir: path.join(directory, 'data'), adminPassword: 'Fixture-Secure-2026!', lowMemory: true, testMode: true }) });
   const server = createServer(runtime.app); await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert.ok(address && typeof address !== 'string'); const origin = `http://127.0.0.1:${address.port}`;
   t.after(async () => {
@@ -56,20 +60,23 @@ test('manual import authenticates and checks CSRF/origin before any site verific
   assert.equal((await f.post(BODY, { 'x-csrf-token': '' })).status, 403);
   assert.equal((await f.post(BODY, { origin: 'https://untrusted.example' })).status, 403);
   assert.equal((await f.post(BODY, { 'content-type': 'text/plain' })).status, 403);
-  assert.deepEqual(f.observed, []); assert.equal(f.runtime.store.accounts().length, 0);
+  assert.deepEqual(f.observed, []); assert.equal(f.runtime.store.accounts().length, 0); assert.equal(f.state.browserLaunches, 0);
 });
 
-test('manual import verifies one read-only identity, saves encrypted credentials and replays a successful request id', async t => {
+test('manual import saves encrypted credentials locally with unknown money and replays a successful request id', async t => {
   const f = await fixture(t), created = await f.post(BODY);
   assert.equal(created.status, 201); assert.equal(created.data.status, 'success');
   const id = created.data.account_id; assert.ok(Number.isSafeInteger(id)); assert.equal(created.data.connection, undefined);
-  assert.deepEqual(f.observed, [{ method: 'GET', path: '/api/user/self', cookie: 'session=' + SESSION, user: '7' }]);
-  const account = f.runtime.store.account(id)!; assert.equal(account.balance, 50);
+  assert.deepEqual(f.observed, []); assert.equal(f.state.browserLaunches, 0);
+  const account = f.runtime.store.account(id)!;
+  assert.equal(account.balance, null); assert.equal(account.used_quota, null); assert.equal(account.total_quota, null); assert.equal(account.has_snapshot, 0);
+  assert.match(account.last_message, /手动|手工|已保存/); assert.doesNotMatch(account.last_message, /身份已确认|已校验并保存/);
+  assert.doesNotMatch(created.data.message, /身份已确认|已校验并保存/);
   assert.equal(f.runtime.store.credentials(account).session, SESSION); assert.equal(account.encrypted.includes(SESSION), false);
   const repeated = await f.post(BODY); assert.equal(repeated.status, 201); assert.equal(repeated.data.account_id, id);
-  assert.equal(f.observed.length, 1); assert.equal(f.runtime.store.accounts().length, 1); assert.equal(f.runtime.store.runs().length, 0);
+  assert.equal(f.observed.length, 0); assert.equal(f.runtime.store.accounts().length, 1); assert.equal(f.runtime.store.runs().length, 0);
   const changed = await f.post({ ...BODY, session: 'another-valid-isolated-session' }); assert.equal(changed.status, 409);
-  assert.equal(f.observed.length, 1); assert.equal(f.runtime.store.accounts().length, 1);
+  assert.equal(f.observed.length, 0); assert.equal(f.runtime.store.accounts().length, 1);
   const bootstrap = await fetch(f.origin + '/api/bootstrap', { headers: { cookie: f.cookie } }).then(response => response.json());
   assert.equal(bootstrap.authorization, null); assert.equal(JSON.stringify(bootstrap).includes(SESSION), false);
 });
@@ -92,24 +99,67 @@ test('manual update preserves an omitted proxy and rejects replacing an existing
   const f = await fixture(t);
   const id = f.runtime.store.addAccount({ name: 'old', provider: 'anyrouter', auth_mode: 'session', enabled: false, interval_hours: 6,
     session: 'original-fixture-session', api_user: '7', proxy: { mode: 'direct' } });
+  f.runtime.store.patch(id, { balance: 42, used_quota: 8, total_quota: 50, has_snapshot: 1 });
   const invalid = await f.post({ ...BODY, account_id: id, api_user: '8', request_id: 'b'.repeat(32) });
   assert.equal(invalid.status, 422); assert.deepEqual(f.observed, []);
   assert.equal(f.runtime.store.credentials(f.runtime.store.account(id)!).session, 'original-fixture-session');
   const updated = await f.post({ ...BODY, account_id: id, interval_hours: 12, request_id: 'c'.repeat(32) });
   assert.equal(updated.status, 200); assert.equal(updated.data.account_id, id); assert.equal(f.runtime.store.accounts().length, 1);
   const row = f.runtime.store.account(id)!; assert.equal(row.interval_hours, 12);
+  assert.equal(row.balance, 42); assert.equal(row.used_quota, 8); assert.equal(row.total_quota, 50); assert.equal(row.has_snapshot, 1);
   assert.deepEqual(f.runtime.store.credentials(row).proxy, { mode: 'direct' }); assert.equal(f.runtime.store.runs().length, 0);
+  assert.deepEqual(f.observed, []); assert.equal(f.state.browserLaunches, 0);
 });
 
-test('concurrent identical manual requests share one verification and a failed check leaves no active authorization', async t => {
+test('concurrent identical manual requests save once and an expired but well-formed Session is stored without verification', async t => {
   const f = await fixture(t); f.state.delay = 75;
   const results = await Promise.all([f.post(BODY), f.post(BODY)]);
   for (const result of results) { assert.equal(result.status, 201); assert.equal(result.data.status, 'success'); }
-  assert.equal(results[0].data.account_id, results[1].data.account_id); assert.equal(f.observed.length, 1);
-  const invalid = await f.post({ ...BODY, session: 'invalid-fixture-session', request_id: 'd'.repeat(32) });
-  assert.equal(invalid.status, 422); assert.equal(f.runtime.store.accounts().length, 1);
+  assert.equal(results[0].data.account_id, results[1].data.account_id); assert.equal(f.observed.length, 0);
+  const expired = await f.post({ ...BODY, session: 'invalid-fixture-session', request_id: 'd'.repeat(32) });
+  assert.equal(expired.status, 201); assert.equal(f.runtime.store.accounts().length, 2);
+  const account = f.runtime.store.account(expired.data.account_id)!;
+  assert.equal(f.runtime.store.credentials(account).session, 'invalid-fixture-session'); assert.equal(account.balance, null); assert.equal(account.has_snapshot, 0);
   const bootstrap = await fetch(f.origin + '/api/bootstrap', { headers: { cookie: f.cookie } }).then(response => response.json());
   assert.equal(bootstrap.authorization, null); assert.equal(f.runtime.imports.current(), null); assert.equal(f.runtime.store.runs().length, 0);
+  assert.deepEqual(f.observed, []); assert.equal(f.state.browserLaunches, 0);
+});
+
+async function waitForRun(f: Awaited<ReturnType<typeof fixture>>, id: number): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (f.runtime.scheduler.isBusy(id) || !f.runtime.store.runs().some(run => run.account_id === id)) {
+    if (Date.now() > deadline) throw new Error('API fixture task did not complete');
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+test('the first explicit run verifies saved credentials before one check-in and records fresh money', async t => {
+  const f = await fixture(t), saved = await f.post(BODY), id = saved.data.account_id;
+  assert.equal(saved.status, 201); assert.equal(f.observed.length, 0); assert.equal(f.runtime.store.account(id)!.balance, null);
+  // WAF browser transport has independent engine coverage. This local API test
+  // isolates when verification begins, using the same real task and HTTP paths.
+  f.runtime.providers.anyrouter.bypass_method = null; f.runtime.providers.anyrouter.waf_cookie_names = [];
+  const started = await f.post({}, {}, `/api/accounts/${id}/run`);
+  assert.equal(started.status, 202); assert.equal(started.data.queued, true); await waitForRun(f, id);
+  assert.deepEqual(f.observed.map(request => [request.path, request.method]),
+    [['/api/user/self', 'GET'], ['/api/user/sign_in', 'POST'], ['/api/user/self', 'GET']]);
+  for (const request of f.observed) { assert.equal(request.cookie, 'session=' + SESSION); assert.equal(request.user, '7'); }
+  const row = f.runtime.store.account(id)!; assert.equal(row.status, 'success'); assert.equal(row.balance, 52); assert.equal(row.has_snapshot, 1);
+  const run = f.runtime.store.runs()[0]; assert.equal(run.status, 'success'); assert.equal(run.reward, 2);
+  assert.equal(f.state.browserLaunches, 0);
+});
+
+test('an expired Session is rejected on the first run without check-in or fabricated balances', async t => {
+  const f = await fixture(t);
+  const saved = await f.post({ ...BODY, session: 'invalid-fixture-session' }), id = saved.data.account_id;
+  assert.equal(saved.status, 201); assert.deepEqual(f.observed, []);
+  f.runtime.providers.anyrouter.bypass_method = null; f.runtime.providers.anyrouter.waf_cookie_names = [];
+  const started = await f.post({}, {}, `/api/accounts/${id}/run`);
+  assert.equal(started.status, 202); assert.equal(started.data.queued, true); await waitForRun(f, id);
+  assert.deepEqual(f.observed, [{ method: 'GET', path: '/api/user/self', cookie: 'session=invalid-fixture-session', user: '7' }]);
+  const row = f.runtime.store.account(id)!; assert.equal(row.status, 'manual_required'); assert.equal(row.balance, null); assert.equal(row.has_snapshot, 0);
+  const run = f.runtime.store.runs()[0]; assert.equal(run.status, 'manual_required'); assert.equal(run.reward, null);
+  assert.equal(f.state.browserLaunches, 0);
 });
 
 test('password account save accepts the site username or email without Session/ID and performs no immediate login or check-in', async t => {
@@ -120,4 +170,5 @@ test('password account save accepts the site username or email without Session/I
   assert.deepEqual(f.observed, []); assert.equal(f.runtime.store.runs().length, 0);
   const credentials = f.runtime.store.credentials(f.runtime.store.account(result.data.id)!);
   assert.equal(credentials.email, 'fixture-user@example.com'); assert.equal(credentials.session, undefined); assert.equal(credentials.api_user, undefined);
+  assert.equal(f.state.browserLaunches, 0);
 });

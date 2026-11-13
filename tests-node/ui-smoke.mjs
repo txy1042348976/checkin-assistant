@@ -276,6 +276,7 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     assert.equal(await page.locator('#local-connector-connect,#local-connector-download,#connector-copy-button,#optional-browser-extension').count(), 0);
     assert.equal(await page.locator('#credential-help').evaluate(el => el.open), false);
     assert.equal(await page.locator('#account-advanced').evaluate(el => el.open), false);
+    assert.equal(await page.locator('#account-submit').innerText(), '保存账号');
     assert.equal(await page.locator('iframe').count(), 0);
   };
   const addBrowser = async (provider, name) => {
@@ -443,11 +444,11 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     assert.equal(state.runs.length, 0); assert.equal((await fixtureState()).checkin_posts.any, 0);
     await original.locator('#site-input').fill('原站标签页保留');
     await page.locator('#account-form [name="session"]').fill('invalid-fixture-session');
-    await page.locator('#account-form [name="api_user"]').fill('7');
+    await page.locator('#account-form [name="api_user"]').fill('0');
     await page.locator('#account-submit').click(); await visible('#account-form [role="alert"]');
     assert.equal((await syncApi()).accounts.length, 0);
     assert.equal(await page.locator('#account-form [name="session"]').inputValue(), 'invalid-fixture-session');
-    await shot('manual-import-rejected.png');
+    await shot('manual-format-rejected.png');
     await page.locator('#credential-help summary').click();
     await page.reload({waitUntil: 'networkidle'});
     assert.equal(await page.locator('#modal').isVisible(), false);
@@ -478,10 +479,12 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     await page.unroute('**/api/accounts/import');
     state = await syncApi();
     const any = state.accounts.find(account => account.provider === 'anyrouter');
-    assert.equal(any.balance, 50); assert.equal(any.used_quota, 10); assert.equal(state.runs.length, 0);
+    assert.equal(any.balance, null); assert.equal(any.used_quota, null); assert.equal(state.runs.length, 0);
+    assert.equal(any.name, '手动填写 · AnyRouter', 'manual save preserves the chosen note without reading the site username');
+    assert.deepEqual((await fixtureState()).identity_reads, {any: 0, agent: 0, sub: 0}, 'manual save and retry make no site identity request');
     assert.equal(original.isClosed(), false); assert.equal(await original.locator('#site-input').inputValue(), '原站标签页保留');
     assert.ok(!JSON.stringify(state).includes(SECRETS.any));
-    mark('default manual credential fields, explicit noopener site link, rejection/retry and no stored browser credentials');
+    mark('manual credential fields save locally, reject invalid ID format and retain the explicit noopener site link');
     mark('lost successful import reply retries with the same request ID and saves no duplicate account');
 
     const agentOriginal = await addBrowser('agentrouter', '手动填写 · AgentRouter');
@@ -490,8 +493,8 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     assert.equal(agentOriginal.isClosed(), false);
     state = await syncApi();
     const agent = state.accounts.find(account => account.provider === 'agentrouter');
-    assert.equal(agent.balance, 80); assert.equal(state.runs.length, 0);
-    mark('AgentRouter manual Session identity/balance save creates no login or check-in');
+    assert.equal(agent.balance, null); assert.equal(state.runs.length, 0);
+    mark('AgentRouter manual Session save leaves balance unknown and performs no site login or identity query');
 
     const subOriginal = await addBrowser('fixture-sub2api', '手动填写 · Sub2API');
     await text('#credential-help-instructions', 'auth_token');
@@ -503,11 +506,12 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     await importManual(SECRETS.sub, '11');
     state = await syncApi();
     const sub = state.accounts.find(account => account.provider === 'fixture-sub2api');
-    assert.equal(sub.balance, 12.75); assert.equal(sub.used_quota, null); assert.equal(state.runs.length, 0);
+    assert.equal(sub.balance, null); assert.equal(sub.used_quota, null); assert.equal(state.runs.length, 0);
+    assert.deepEqual((await fixtureState()).identity_reads, {any: 0, agent: 0, sub: 0}, 'all manual account saves leave identity lookup for the first run');
     assert.equal(subOriginal.isClosed(), false);
-    mark('Sub2API direct manual Token fields and same-site identity verification');
+    mark('Sub2API manual Token fields save locally and keep the first balance unknown');
 
-    const loginPostsBeforePassword = (await fixtureState()).login_posts;
+    const siteBeforePassword = await fixtureState();
     await page.locator('[data-action="add"]').first().click(); await manualDefault();
     await page.locator('[name="provider"]').selectOption('agentrouter');
     await page.locator('[data-method="password"]').click();
@@ -526,10 +530,21 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     state = await syncApi();
     const passwordAccount = state.accounts.find(account => account.name === 'AgentRouter · 站内密码');
     assert.equal(passwordAccount.auth_mode, 'password'); assert.equal(passwordAccount.balance, null);
-    assert.deepEqual((await fixtureState()).login_posts, loginPostsBeforePassword, 'saving a password does not claim or execute login');
+    assert.deepEqual((await fixtureState()).login_posts, siteBeforePassword.login_posts, 'saving a password does not claim or execute login');
+    assert.deepEqual((await fixtureState()).identity_reads, siteBeforePassword.identity_reads, 'saving a password makes no site identity query');
     assert.ok(!JSON.stringify(state).includes('Fixture-Agent-Site-Password!'));
+    await page.locator('.nav-item[data-view="accounts"]').click();
+    await page.locator(`[data-action="edit"][data-id="${passwordAccount.id}"]`).click();
+    await page.locator('#account-form [name="email"]').fill('fixture-agent-updated');
+    await page.locator('#account-form [name="password"]').fill('Fixture-Agent-Site-Password-Updated!');
+    await page.locator('#account-submit').click(); await page.locator('#modal').waitFor({state: 'hidden'});
+    const updatedPasswordAccount = (await syncApi()).accounts.find(account => account.id === passwordAccount.id);
+    assert.equal(updatedPasswordAccount.auth_mode, 'password'); assert.equal(updatedPasswordAccount.balance, null);
+    assert.deepEqual((await fixtureState()).login_posts, siteBeforePassword.login_posts, 'updating a password does not execute site login');
+    assert.deepEqual((await fixtureState()).identity_reads, siteBeforePassword.identity_reads, 'updating a password does not read the site identity');
+    assert.ok(!JSON.stringify(updatedPasswordAccount).includes('Fixture-Agent-Site-Password-Updated!'));
     await api.json(`/api/accounts/${passwordAccount.id}`, {method: 'DELETE', body: {}}); await page.evaluate(() => refresh(true));
-    mark('AgentRouter accepts site username/password fields and saves encrypted credentials without claiming successful login');
+    mark('AgentRouter username/password creation and updates save encrypted credentials without site login or identity reads');
 
     await page.locator('.nav-item[data-view="overview"]').click();
     const beforeQuickActions = await syncApi();
@@ -548,7 +563,7 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
         await trigger.click(); await visible(form);
         const beforeCancelRefresh = await trigger.elementHandle();
         await page.evaluate(() => refresh(true));
-        await until(() => beforeCancelRefresh.evaluate(element => !element.isConnected), `${action}: workspace refreshed with dialog open`);
+        assert.equal(await beforeCancelRefresh.evaluate(element => element.isConnected), true, `${action}: unchanged workspace retains its shortcut with dialog open`);
         await beforeCancelRefresh.dispose();
         await visible(form);
         await page.locator('#modal').getByRole('button', {name: '取消', exact: true}).click();
@@ -556,9 +571,26 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
         assert.equal(await trigger.evaluate(element => document.activeElement === element), true, `${action}: cancel restores shortcut focus`);
         const beforeFocusRefresh = await trigger.elementHandle();
         await page.evaluate(() => refresh(true));
-        await until(() => beforeFocusRefresh.evaluate(element => !element.isConnected), `${action}: workspace refreshed with shortcut focused`);
+        assert.equal(await beforeFocusRefresh.evaluate(element => element.isConnected && document.activeElement === element), true, `${action}: unchanged workspace preserves the focused node`);
         await beforeFocusRefresh.dispose();
         assert.equal(await trigger.evaluate(element => document.activeElement === element), true, `${action}: refresh preserves shortcut focus`);
+      }
+      const changedTrigger = page.locator('.quick-panel [data-action="settings"]');
+      await changedTrigger.focus();
+      const beforeChangedRefresh = await changedTrigger.elementHandle();
+      const changedBootstrap = async route => {
+        const response = await route.fetch(), data = await response.json();
+        await route.fulfill({response, json: {...data, engine: {...data.engine, version: 'focus-change-fixture'}}});
+      };
+      await page.route('**/api/bootstrap', changedBootstrap);
+      try {
+        await page.evaluate(() => refresh(true));
+        await until(() => beforeChangedRefresh.evaluate(element => !element.isConnected), 'changed workspace rebuilds controls');
+        assert.equal(await changedTrigger.evaluate(element => document.activeElement === element), true, 'changed workspace restores shortcut focus');
+      } finally {
+        await beforeChangedRefresh.dispose();
+        await page.unroute('**/api/bootstrap', changedBootstrap);
+        await page.evaluate(() => refresh(true));
       }
       await page.locator('.quick-panel [data-view="logs"]').click();
       await visible('.logs-panel'); assert.equal(new URL(page.url()).hash, '#logs');
@@ -653,6 +685,7 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     assert.deepEqual((await syncApi()).amounts, originalAmounts, 'browser display scenarios leave fixture account data unchanged');
     mark('sole CNY and site-credit units select the available currency and display correct balance/reward values');
 
+    const siteBeforeAccountEdit = await fixtureState();
     await page.locator('.nav-item[data-view="accounts"]').click();
     await page.locator(`[data-action="edit"][data-id="${any.id}"]`).click();
     await page.locator('#account-form [name="name"]').fill('AnyRouter · Node 已编辑');
@@ -663,12 +696,31 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     state = await syncApi();
     const edited = state.accounts.find(account => account.id === any.id);
     assert.equal(edited.name, 'AnyRouter · Node 已编辑'); assert.equal(edited.interval_hours, 12); assert.equal(edited.enabled, false);
+    await page.locator(`[data-action="relogin"][data-id="${any.id}"]`).click();
+    await importManual(SECRETS.any, '7');
+    const refilled = (await syncApi()).accounts.find(account => account.id === any.id);
+    assert.equal(refilled.name, edited.name); assert.equal(refilled.interval_hours, 12); assert.equal(refilled.enabled, false);
+    assert.equal(refilled.balance, null);
+    assert.deepEqual((await fixtureState()).identity_reads, siteBeforeAccountEdit.identity_reads, 'editing and refilling Session stay local');
+    assert.deepEqual((await fixtureState()).login_posts, siteBeforeAccountEdit.login_posts, 'Session updates make no automatic site login');
     await shot('accounts-desktop.png');
-    mark('account editing, preserved credentials, interval, enabled state and search');
+    mark('account editing and Session refilling preserve settings and make no site login or identity reads');
 
     await page.route('**/api/providers/probe', route => route.fulfill({status: 200, contentType: 'application/json',
       body: JSON.stringify({recognized: false, message: 'Isolated probe fixture', domain: 'https://compatible.example.invalid'})}));
     await page.locator('.nav-item[data-view="sites"]').click();
+    const pagesBeforeSiteAdd = context.pages().length, siteBeforeTargetedAdd = await fixtureState();
+    await page.locator('[data-action="site-account"][data-site="agentrouter"]').click();
+    await visible('#account-form [name="session"]'); await visible('#account-form [name="api_user"]');
+    assert.equal(await page.locator('#account-provider').inputValue(), 'agentrouter');
+    assert.equal(await page.locator('#account-provider').isDisabled(), true);
+    assert.equal(await page.locator('#account-submit').innerText(), '保存账号');
+    assert.equal(await page.locator('[data-method="github"],[data-method="linuxdo"],iframe').count(), 0);
+    assert.equal(context.pages().length, pagesBeforeSiteAdd, 'site-specific account entry opens the manual form in place');
+    await page.locator('#modal [data-action="close"]').first().click(); await page.locator('#modal').waitFor({state: 'hidden'});
+    assert.deepEqual((await fixtureState()).identity_reads, siteBeforeTargetedAdd.identity_reads);
+    assert.deepEqual((await fixtureState()).login_posts, siteBeforeTargetedAdd.login_posts);
+    mark('site-specific account entry fixes the chosen site and opens manual fields without acquiring credentials');
     await page.locator('[data-action="add-site"]').first().click();
     await page.locator('#site-name').fill('兼容站点 · Node 测试');
     await page.locator('#site-domain').fill('https://compatible.example.invalid');
@@ -743,6 +795,25 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     assert.deepEqual(observed.forbidden, []);
     mark('real local AnyRouter/Sub2API check-in engines; AgentRouter sync creates no reward/login/check-in');
 
+    const beforeExpiredSave = await fixtureState();
+    await page.locator('[data-action="add"]').first().click(); await manualDefault();
+    await page.locator('#account-form [name="name"]').fill('过期凭据 · 手动保存测试');
+    await advancedSettings(); await page.locator('#proxy-mode').selectOption('direct'); await advancedSettings(false);
+    await importManual('expired-synthetic-session', '7');
+    const expiredAccount = (await syncApi()).accounts.find(account => account.name === '过期凭据 · 手动保存测试');
+    assert.ok(expiredAccount); assert.equal(expiredAccount.balance, null); assert.equal(expiredAccount.status, 'idle');
+    assert.deepEqual((await fixtureState()).identity_reads, beforeExpiredSave.identity_reads, 'format-valid expired credentials can be saved without contacting the site');
+    await api.json(`/api/accounts/${expiredAccount.id}/run`, {method: 'POST', body: {}});
+    await until(async () => {
+      const current = await syncApi(), run = current.runs.find(run => run.account_id === expiredAccount.id);
+      return run && !['queued', 'running'].includes(run.status) ? run : false;
+    }, 'expired credentials are checked only during an explicit run', 65000);
+    const expiredResult = (await syncApi()).accounts.find(account => account.id === expiredAccount.id);
+    assert.ok(['manual_required', 'failed'].includes(expiredResult.status)); assert.equal(expiredResult.balance, null);
+    assert.deepEqual((await fixtureState()).checkin_posts, beforeExpiredSave.checkin_posts, 'an expired session never reaches a check-in write');
+    await api.json(`/api/accounts/${expiredAccount.id}`, {method: 'DELETE', body: {}}); await page.evaluate(() => refresh(true));
+    mark('expired but format-valid Session saves locally and is rejected on its first run without a false balance or reward');
+
     await page.locator('.nav-item[data-view="logs"]').click();
     await page.evaluate(() => refresh(true));
     await page.locator('[data-log-filter="synced"]').click();
@@ -790,23 +861,21 @@ export async function runUiSmoke({base, fixtureOrigin, fixtureControl = fixtureO
     await page.locator('#modal').waitFor({state: 'hidden'});
     assert.equal((await syncApi()).accounts.length, 3);
     assert.equal(cancelOriginal.isClosed(), false);
-    const pending = await api.json('/api/login/start', {method: 'POST', body: {provider: 'anyrouter', method: 'manual', name: '旧连接恢复测试', interval_hours: 6, proxy: {mode: 'direct'}}});
-    const cancelledConnection = pending.connection;
-    await page.reload({waitUntil: 'networkidle'}); await text('#queue-subtitle', '已恢复当前连接');
-    await visible('#browser-import-form');
-    assert.equal(await page.locator('#local-connector-connect,#connector-copy-button,#optional-browser-extension').count(), 0);
-    const descriptor = await api.request(`/api/browser-import/${cancelledConnection.id}`, {auth: false, headers: {Authorization: `Bearer ${cancelledConnection.ticket}`}});
-    assert.equal(descriptor.status, 200); assert.equal(descriptor.data.provider.id, 'anyrouter');
-    assert.ok(!descriptor.text.includes(cancelledConnection.ticket));
-    const cancelButton = await page.locator('[data-action="cancel-login"]').elementHandle();
-    await cancelButton.focus();
-    await page.evaluate(() => { for (let index = 0; index < 3; index++) renderLoginQueue(state.loginQueue); });
-    assert.equal(await cancelButton.evaluate(element => element.isConnected && document.activeElement === element), true, 'unchanged login polling preserves the cancel control and its focus');
-    await cancelButton.dispose();
-    await page.locator('[data-action="cancel-login"]').click(); await page.locator('#modal').waitFor({state: 'hidden'});
-    await until(async () => (await api.request(`/api/browser-import/${cancelledConnection.id}`, {auth: false, headers: {Authorization: `Bearer ${cancelledConnection.ticket}`}})).status === 410, 'cancelled old ticket rejected');
+    assert.equal((await api.request('/api/login/start', {method: 'POST', body: {provider: 'anyrouter', method: 'manual', name: '退役连接测试', interval_hours: 6}})).status, 410);
+    for (const route of ['/api/login/retired-fixture', '/api/browser-import/retired-fixture']) assert.equal((await api.request(route)).status, 410);
+    const retiredAuthorization = async route => {
+      const response = await route.fetch(), current = await response.json();
+      await route.fulfill({response, json: {...current, authorization: {id: 'retired-fixture', provider: 'anyrouter', method: 'manual', status: 'waiting', name: '旧授权', elapsed: 100}}});
+    };
+    await page.route('**/api/bootstrap', retiredAuthorization);
+    try {
+      const retainedView = new URL(page.url()).hash.slice(1) || 'overview';
+      await page.reload({waitUntil: 'networkidle'}); await visible(`#app[data-view="${retainedView}"]`);
+      assert.equal(await page.locator('#modal').isVisible(), false, 'retired authorization data cannot open an automatic account acquisition flow');
+      assert.equal(await page.locator('#browser-import-form,#queue-progress,#optional-browser-extension').count(), 0);
+    } finally { await page.unroute('**/api/bootstrap', retiredAuthorization); }
     assert.equal(cancelOriginal.isClosed(), false);
-    mark('mobile manual forms, cancellation without save and legacy pending import restores direct fields');
+    mark('mobile manual forms cancel without saving; retired login/import routes cannot restore an authorization queue');
 
     await page.setViewportSize({width: 1440, height: 1000});
     await page.locator('.nav-item[data-view="accounts"]').click();

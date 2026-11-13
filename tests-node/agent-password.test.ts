@@ -39,12 +39,13 @@ function json(response: ServerResponse, status: number, data: unknown, cookies?:
 const sessionCookie = `session=${SESSION}; Path=/; HttpOnly; SameSite=Lax`;
 const profile = (id: number | string = 7) => ({ success: true, data: { id, quota: 25_000_000, used_quota: 2_500_000, checked_in: true } });
 
-async function fixture(t: TestContext, handler: (request: IncomingMessage, response: ServerResponse, body: unknown) => void | Promise<void>) {
+async function fixture(t: TestContext, handler: (request: IncomingMessage, response: ServerResponse, body: unknown) => void | Promise<void>, browser = false) {
   const provider = structuredClone(PROVIDERS.agentrouter);
   // Keep the real builtin name, paths, quota units and no-sign-in behavior.
-  // WAF transport is covered separately; these tests isolate password protocol.
-  provider.bypass_method = null;
-  provider.waf_cookie_names = [];
+  // WAF transport is covered separately; a focused browser case verifies the
+  // saved-Session balance read needed to calculate password-login rewards.
+  provider.bypass_method = browser ? 'waf_cookies' : null;
+  provider.waf_cookie_names = browser ? ['acw_tc'] : [];
   const observed: ObservedRequest[] = [];
   const server = createServer(async (request, response) => {
     let bodyText = '';
@@ -69,6 +70,66 @@ async function fixture(t: TestContext, handler: (request: IncomingMessage, respo
   });
   return { engine, observed, provider };
 }
+
+test('Agent password compares a fresh saved-Session balance before clearing it and logging in', async t => {
+  const f = await fixture(t, (request, response) => {
+    const path = new URL(request.url!, 'http://localhost').pathname;
+    if (path === '/login') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': 'acw_tc=fixture-waf; Path=/; SameSite=Lax' });
+      response.end('<!doctype html><title>Fixture</title>');
+      return;
+    }
+    if (path === '/api/user/login' && request.method === 'POST') {
+      assert.equal(String(request.headers.cookie).includes(OLD_SESSION), false);
+      assert.equal(String(request.headers.cookie).includes('acw_tc=fixture-waf'), true);
+      return json(response, 200, { success: true, data: { id: 7, checked_in: true } }, [sessionCookie]);
+    }
+    if (path === '/api/user/self') {
+      if (String(request.headers.cookie).includes(OLD_SESSION)) return json(response, 200, {
+        success: true, data: { id: 7, quota: 20_000_000, used_quota: 2_500_000 },
+      });
+      return json(response, 200, profile());
+    }
+    response.writeHead(404); response.end();
+  }, true);
+
+  const result = await f.engine.run(row(), credentials('agent-alias', { api_user: '7' }));
+  assert.equal(result.status, 'success');
+  assert.equal(result.before_balance, 40);
+  assert.equal(result.after_balance, 50);
+  assert.equal(result.reward, 10);
+  const userRequests = f.observed.filter(request => request.path.startsWith('/api/user'));
+  assert.deepEqual(userRequests.map(request => [request.path, request.method]), [
+    ['/api/user/self', 'GET'], ['/api/user/login', 'POST'], ['/api/user/self', 'GET'],
+  ]);
+  assert.equal(userRequests[0].cookie.includes(OLD_SESSION), true);
+  assert.equal(userRequests[1].cookie.includes(OLD_SESSION), false);
+  assert.equal(userRequests[2].cookie.includes(SESSION), true);
+});
+
+test('Agent password still completes when the saved Session cannot provide a fresh baseline', async t => {
+  const f = await fixture(t, (request, response) => {
+    const path = new URL(request.url!, 'http://localhost').pathname;
+    if (path === '/login') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': 'acw_tc=fixture-waf; Path=/; SameSite=Lax' });
+      response.end('<!doctype html><title>Fixture</title>');
+      return;
+    }
+    if (path === '/api/user/login' && request.method === 'POST') return json(response, 200,
+      { success: true, data: { id: 7, checked_in: true } }, [sessionCookie]);
+    if (path === '/api/user/self' && String(request.headers.cookie).includes(OLD_SESSION)) return json(response, 401, { success: false });
+    if (path === '/api/user/self') return json(response, 200, profile());
+    response.writeHead(404); response.end();
+  }, true);
+
+  const result = await f.engine.run(row(), credentials('agent-alias', { api_user: '7' }));
+  assert.equal(result.status, 'success');
+  assert.equal(result.after_balance, 50);
+  assert.equal(result.reward, null);
+  assert.match(result.message, /奖励金额暂未确认/);
+  assert.equal(f.observed.filter(request => request.path === '/api/user/login').length, 1);
+  assert.equal(f.observed.filter(request => request.path === '/api/user/self').length, 2);
+});
 
 for (const identity of ['agent-alias', 'agent-fixture@example.test']) {
   test(`Agent password submits ${identity.includes('@') ? 'email' : 'username'} in username and derives Session and ID`, async t => {

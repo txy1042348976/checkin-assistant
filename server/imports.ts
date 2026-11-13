@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import type { BrowserResources } from './browser-resources.js';
 import { BrowserSession } from './engine.js';
 import { HttpError, boundedString, isRecord, requireRecord } from './errors.js';
 import { normalizeProxy, resolveProxy } from './proxy.js';
@@ -152,7 +153,7 @@ export function normalizeImportCookies(items: CookieData[], options: { host?: st
   return result;
 }
 
-export async function verifyImportProfile(provider: Provider, payload: ImportPayload, proxy: ProxyConfig, config: AppConfig, signal?: AbortSignal): Promise<Profile> {
+export async function verifyImportProfile(provider: Provider, payload: ImportPayload, proxy: ProxyConfig, config: AppConfig, signal?: AbortSignal, browserResources?: BrowserResources): Promise<Profile> {
   const headers: Record<string, string> = { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest',
     'Cache-Control': 'no-cache', Referer: provider.domain + provider.login_path };
   const target = new URL(provider.user_info_path, provider.domain);
@@ -175,9 +176,9 @@ export async function verifyImportProfile(provider: Provider, payload: ImportPay
   try {
     let response = await httpRequest(target.href, { method: 'GET', headers, provider, proxy, config, timeoutMs: 20_000, maxBytes: 512 * 1024, signal });
     if (provider.bypass_method === 'waf_cookies' && provider.waf_cookie_names.length && guardedResponse(response)) {
-      const browserSignal = signal || AbortSignal.timeout(25_000);
-      const browser = new BrowserSession(provider, config, resolveProxy(provider, proxy, config), browserSignal);
-      const abortBrowser = () => { void browser.close(); };
+      const browserSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(25_000)]) : AbortSignal.timeout(25_000);
+      const browser = new BrowserSession(provider, config, resolveProxy(provider, proxy, config), browserSignal, browserResources);
+      const abortBrowser = () => { void browser.close().catch(() => {}); };
       browserSignal.addEventListener('abort', abortBrowser, { once: true });
       try {
         await browser.start({ session: payload.session, api_user: payload.api_user,
@@ -213,7 +214,8 @@ export class UserBrowserImports {
 
   constructor(private store: Store, private providers: Record<string, Provider>, private security: WebSecurity,
     private config: AppConfig, private accountBusy: (id: number) => boolean = () => false,
-    verifier: typeof verifyImportProfile = verifyImportProfile) {
+    verifier: typeof verifyImportProfile = verifyImportProfile, private browserResources?: BrowserResources,
+    private manualOnly = false) {
     this.verify = verifier;
     this.store.db.exec(`CREATE TABLE IF NOT EXISTS browser_imports (
       id TEXT PRIMARY KEY, ticket_hash TEXT NOT NULL, owner_fingerprint TEXT NOT NULL,
@@ -222,7 +224,10 @@ export class UserBrowserImports {
     ); CREATE INDEX IF NOT EXISTS browser_imports_expiry ON browser_imports(expires_at);`);
     const interrupted = this.store.db.prepare("SELECT * FROM browser_imports WHERE status IN ('waiting','verifying')").all() as unknown as ImportRow[];
     for (const row of interrupted) {
-      if (this.context(row).manual_request_hash) {
+      if (this.manualOnly && !this.context(row).manual_request_hash) {
+        this.store.db.prepare("UPDATE browser_imports SET status='cancelled',message=? WHERE id=?")
+          .run('请在账号表单手动填写并保存账号。', row.id);
+      } else if (this.context(row).manual_request_hash) {
         this.store.db.prepare("UPDATE browser_imports SET status='failed',message=? WHERE id=?")
           .run('上次保存被中断，请重新填写原站登录凭据并保存。', row.id);
       } else if (row.status === 'verifying') {
@@ -305,7 +310,8 @@ export class UserBrowserImports {
     this.store.transaction(() => {
       this.store.db.prepare('INSERT INTO browser_imports(id,ticket_hash,owner_fingerprint,created_at,expires_at,status,encrypted_context,message) VALUES(?,?,?,?,?,?,?,?)')
         .run(id, hash(ticket), this.security.adminFingerprint(), now, now + IMPORT_SECONDS, 'waiting', this.store.encryptCredentials(context),
-          '请在原站登录后填写本站 Session 和用户 ID，后台确认身份与余额后保存。');
+          this.manualOnly ? '请手动填写本站 Session 和用户 ID，保存后在首次运行时验证。'
+            : '请在原站登录后填写本站 Session 和用户 ID，后台确认身份与余额后保存。');
       this.store.db.prepare("DELETE FROM browser_imports WHERE expires_at<? AND status NOT IN ('waiting','verifying')").run(now - 86400);
     });
     return this.view(id)!;
@@ -405,29 +411,33 @@ export class UserBrowserImports {
     payload.oauth_cookies = normalizeImportCookies(payload.oauth_cookies, { roots: context.method === 'github' ? ['github.com'] : context.method === 'linuxdo' ? ['linux.do'] : [] });
     if (payload.refresh_token && !isSub2API(provider)) throw new HttpError(422, '当前站点不使用 Refresh Token。');
     this.store.db.prepare("UPDATE browser_imports SET status='verifying',attempts=attempts+1,message=? WHERE id=?")
-      .run('正在后台只读校验原站点身份和余额…', id);
+      .run(this.manualOnly ? '正在加密保存手动填写的账号…' : '正在后台只读校验原站点身份和余额…', id);
     const controller = new AbortController();
     this.controllers.set(id, controller);
     const timeout = setTimeout(() => controller.abort(), 25_000); timeout.unref();
     try {
       const aborted = new Promise<never>((_resolve, reject) => controller.signal.addEventListener('abort', () => reject(new HttpError(409, '校验已取消或超时，登录状态未保存。')), { once: true }));
-      const profile = await Promise.race([this.verify(provider, payload, context.proxy, this.config, controller.signal), aborted]);
+      // Manual saves never contact the provider. The supplied ID is validated
+      // locally and remains unverified until the first scheduled or manual run.
+      const profile: Profile = this.manualOnly ? { id: payload.api_user }
+        : await Promise.race([this.verify(provider, payload, context.proxy, this.config, controller.signal, this.browserResources), aborted]);
       if (controller.signal.aborted) throw new HttpError(409, '校验已取消或超时，登录状态未保存。');
       if (String(profile.id) !== payload.api_user) throw new HttpError(422, '站点身份与导入用户 ID 不一致，未保存。');
       const current = this.row(id);
       if (!current || current.status !== 'verifying') throw new HttpError(409, '连接已取消或过期，登录状态未保存。');
       this.checkAccount(target, provider.name, payload.api_user);
-      const snapshot = profileSnapshot(profile, provider);
+      const snapshot = this.manualOnly ? null : profileSnapshot(profile, provider);
       const credentials = { session: payload.session, api_user: payload.api_user, site_cookies: payload.site_cookies,
         oauth_cookies: payload.oauth_cookies, oauth_user_agent: payload.oauth_user_agent,
         refresh_token: payload.refresh_token || undefined, proxy: context.proxy };
       const name = (context.name || String(profile.username || '站点账号')).slice(0, 40);
-      let message = `已校验并保存「${name}」的原站登录状态。`;
+      let message = this.manualOnly ? `已手动保存「${name}」。首次运行时验证登录状态并更新余额。`
+        : `已校验并保存「${name}」的原站登录状态。`;
       if (provider.name === 'agentrouter' && !payload.oauth_cookies.length) {
         message += context.method === 'manual' ? ' 当前仅同步余额；需要自动登录签到时请选择站内账号密码方式。'
           : ' 当前可同步余额；后台 OAuth 签到需要额外连接对应上游会话。';
       }
-      if (!snapshot) message += ' 本次身份已确认，余额暂未知。';
+      if (!snapshot && !this.manualOnly) message += ' 本次身份已确认，余额暂未知。';
       this.store.transaction(() => {
         let savedId: number;
         if (target !== null) {

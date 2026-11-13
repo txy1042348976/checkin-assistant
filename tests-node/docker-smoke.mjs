@@ -4,9 +4,10 @@ import {createHash, randomUUID} from 'node:crypto';
 import {mkdir, mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {inflateRawSync} from 'node:zlib';
 import {ApiClient, PASSWORD, ROOT, SECRETS, USERNAME, argumentsFor, freePort, ready, runUiSmoke, startFixture, until} from './ui-smoke.mjs';
 import {runAccountTransferUiSmoke} from './account-transfer-ui-smoke.mjs';
+
+const EXPIRED_SESSION = 'expired-docker-fixture-session';
 
 async function docker(args, {timeout = 90000, allowFailure = false} = {}) {
   return new Promise((resolve, reject) => {
@@ -46,27 +47,19 @@ async function localArtifacts() {
   return result;
 }
 
-function unzip(buffer) {
-  let end = buffer.length - 22;
-  while (end >= Math.max(0, buffer.length - 65557) && buffer.readUInt32LE(end) !== 0x06054b50) end--;
-  assert.ok(end >= 0 && buffer.readUInt32LE(end) === 0x06054b50, 'ZIP end record');
-  assert.equal(buffer.readUInt16LE(end + 4), 0); assert.equal(buffer.readUInt16LE(end + 6), 0);
-  const count = buffer.readUInt16LE(end + 10), entries = new Map();
-  let offset = buffer.readUInt32LE(end + 16);
-  for (let index = 0; index < count; index++) {
-    assert.equal(buffer.readUInt32LE(offset), 0x02014b50, 'ZIP directory entry');
-    const method = buffer.readUInt16LE(offset + 10), size = buffer.readUInt32LE(offset + 20);
-    const length = buffer.readUInt16LE(offset + 28), extra = buffer.readUInt16LE(offset + 30), comment = buffer.readUInt16LE(offset + 32);
-    const local = buffer.readUInt32LE(offset + 42), name = buffer.subarray(offset + 46, offset + 46 + length).toString('utf8');
-    assert.equal(buffer.readUInt32LE(local), 0x04034b50, 'ZIP local entry');
-    const start = local + 30 + buffer.readUInt16LE(local + 26) + buffer.readUInt16LE(local + 28);
-    const data = buffer.subarray(start, start + size);
-    assert.ok(method === 0 || method === 8, 'ZIP compression');
-    assert.ok(!entries.has(name) && !name.startsWith('/') && !name.split('/').includes('..'), 'ZIP safe unique filenames');
-    entries.set(name, method === 8 ? inflateRawSync(data) : data);
-    offset += 46 + length + extra + comment;
+async function assertRetiredAuthorization(api) {
+  const id = 'a'.repeat(32), ticket = 'A'.repeat(43);
+  const contexts = [{auth: false}, {auth: true}, {auth: false,
+    headers: {Authorization: `Bearer ${ticket}`, Origin: `chrome-extension://${'a'.repeat(32)}`}}];
+  const routes = ['/api/login/start', `/api/login/${id}`, `/api/login/${id}/import`, `/api/browser-import/${id}`,
+    '/downloads/checkin-assistant-browser-extension.zip'];
+  for (const route of routes) for (const method of ['GET', 'POST', 'HEAD']) for (const context of contexts) {
+    const response = await api.request(route, {method, csrf: false, ...context,
+      ...(method === 'POST' ? {body: {provider: 'anyrouter', method: 'manual', name: '退役授权测试', interval_hours: 12,
+        session: SECRETS.any, api_user: '7'}} : {})});
+    assert.equal(response.status, 410, `${method} ${route} remains retired for anonymous, authenticated and extension requests`);
   }
-  return entries;
+  return {login_api_status: 410, browser_import_api_status: 410, extension_download_status: 410};
 }
 
 const RUNTIME_INSPECTION = `
@@ -128,10 +121,10 @@ const PERSISTENCE_INSPECTION = `
   import {createHash} from 'node:crypto';
   import {DatabaseSync} from 'node:sqlite';
   const db=new DatabaseSync('/data/checkin-assistant.db',{readOnly:true});
-  const accounts=db.prepare('SELECT id,encrypted FROM accounts ORDER BY id').all();
+  const accounts=db.prepare('SELECT id,encrypted,balance,used_quota,total_quota,has_snapshot FROM accounts ORDER BY id').all();
   const admin=db.prepare('SELECT username,password_hash FROM web_admin WHERE id=1').get();
   const imports=db.prepare('SELECT status,encrypted_context FROM browser_imports').all();
-  const secrets=${JSON.stringify(Object.values(SECRETS).concat(PASSWORD))};
+  const secrets=${JSON.stringify(Object.values(SECRETS).concat(PASSWORD, EXPIRED_SESSION))};
   const plaintextFiles=readdirSync('/data').filter(name=>{
     const file='/data/'+name;
     return statSync(file).isFile()&&secrets.some(secret=>readFileSync(file).includes(Buffer.from(secret)));
@@ -140,8 +133,10 @@ const PERSISTENCE_INSPECTION = `
     administrator_count:Number(db.prepare('SELECT COUNT(*) AS count FROM web_admin').get().count),
     administrator_username:admin.username,
     administrator_password_hash_sha256:createHash('sha256').update(admin.password_hash).digest('hex'),
-    account_ids:accounts.map(row=>row.id),credentials_encrypted:accounts.every(row=>row.encrypted.startsWith('gAAAA')),
+    account_ids:accounts.map(row=>row.id),account_snapshots:accounts.map(({id,balance,used_quota,total_quota,has_snapshot})=>({id,balance,used_quota,total_quota,has_snapshot})),
+    credentials_encrypted:accounts.every(row=>row.encrypted.startsWith('gAAAA')),
     import_contexts_encrypted:imports.every(row=>row.encrypted_context.startsWith('gAAAA')),
+    active_authorization_records:imports.filter(row=>['waiting','verifying'].includes(row.status)).length,
     password_is_hash:typeof admin.password_hash==='string'&&admin.password_hash!==${JSON.stringify(PASSWORD)},
     plaintextFiles,setup_token_present:existsSync('/data/web-setup-token')}));
   db.close();
@@ -238,50 +233,60 @@ async function main() {
     `);
     assert.deepEqual(packaged, await localArtifacts());
     report.artifacts = {files: Object.keys(packaged).length,sha256_matches_local_build: true};
-    mark('packaged server, modern UI, optional extension and deployment scripts match the local build bytes');
+    mark('packaged server, modern UI, historical extension sources and deployment scripts match the local build bytes');
 
     const api = new ApiClient(base);
     await api.json('/api/auth/login', {method: 'POST', csrf: false, body: {username: USERNAME, password: PASSWORD}});
     assert.equal((await api.json('/api/auth/status')).username, USERNAME);
     const bootstrap = await api.json('/api/bootstrap');
     assert.equal(bootstrap.web.authorization_mode, 'manual');
+    assert.equal(bootstrap.authorization, null); assert.equal(bootstrap.web.extension_url, undefined);
     assert.equal(bootstrap.web.connector_url, undefined); assert.equal(bootstrap.web.connector_version, undefined);
     assert.deepEqual(bootstrap.engine.login_methods, ['password', 'session']);
-    const archiveResponse = await fetch(base + '/downloads/checkin-assistant-browser-extension.zip', {
-      headers: {Cookie: api.cookie}, signal: AbortSignal.timeout(10000)});
-    assert.equal(archiveResponse.status, 200);
-    const archive = Buffer.from(await archiveResponse.arrayBuffer()), files = unzip(archive);
-    const whitelist = ['manifest.json', 'background.mjs', 'bridge.mjs', 'helpers.mjs', 'popup.html', 'popup.css', 'popup.mjs',
-      'shield.svg', 'README.md', 'icons/16.png', 'icons/32.png', 'icons/48.png', 'icons/128.png'];
-    assert.deepEqual([...files.keys()].sort(), whitelist.sort());
-    const manifest = JSON.parse(files.get('manifest.json').toString('utf8'));
-    assert.equal(manifest.manifest_version, 3); assert.ok(manifest.name.startsWith('签到助手'));
-    assert.deepEqual(manifest.host_permissions || [], []); assert.equal(manifest.incognito, 'not_allowed');
-    for (const filename of ['16', '32', '48', '128'].map(size => `icons/${size}.png`)) assert.equal(files.get(filename).readUInt32BE(0), 0x89504e47);
-    report.extension_files = [...files.keys()];
-    mark('downloadable extension ZIP contains only complete distributable files with optional site permissions');
+    report.retired_authorization = await assertRetiredAuthorization(api);
+    const afterRetired = await api.json('/api/bootstrap');
+    assert.equal(afterRetired.authorization, null); assert.deepEqual(afterRetired.accounts, bootstrap.accounts);
+    assert.deepEqual(afterRetired.runs, bootstrap.runs);
+    mark('retired login, browser-import and extension download routes return HTTP 410 without creating an authorization queue');
 
+    assert.equal(bootstrap.settings.scheduler_enabled, false, 'manual-save fixture must not schedule accounts before explicit runs');
+    const fixtureBeforeManual = structuredClone(fixture.state);
     const manualBody = {provider: 'anyrouter', name: 'Docker 持久化账号', interval_hours: 12, proxy: {mode: 'direct'},
       session: SECRETS.any, api_user: '7', request_id: randomUUID().replaceAll('-', '')};
     const saved = await api.json('/api/accounts/import', {method: 'POST', body: manualBody});
-    assert.equal(saved.status, 'success');
-    const pending = await api.json('/api/login/start', {method: 'POST', body: {provider: 'fixture-sub2api', method: 'manual',
-      name: 'Docker 重启后导入', interval_hours: 12, proxy: {mode: 'direct'}}});
-    const connection = pending.connection;
+    assert.equal(saved.status, 'success'); assert.match(saved.message, /首次运行/);
+    assert.doesNotMatch(saved.message, /身份已确认|已校验/);
+    const expiredBody = {...manualBody, name: 'Docker 过期凭据待首次运行', session: EXPIRED_SESSION,
+      request_id: randomUUID().replaceAll('-', '')};
+    const expiredSaved = await api.json('/api/accounts/import', {method: 'POST', body: expiredBody});
+    assert.equal(expiredSaved.status, 'success');
+    const manualState = await api.json('/api/bootstrap');
+    for (const id of [saved.account_id, expiredSaved.account_id]) {
+      const account = manualState.accounts.find(account => account.id === id);
+      assert.ok(account); assert.equal(account.auth_mode, 'session'); assert.equal(account.status, 'idle');
+      assert.equal(account.balance, null); assert.equal(account.used_quota, null);
+    }
+    assert.equal(manualState.authorization, null); assert.deepEqual(manualState.runs, bootstrap.runs);
+    for (const counter of ['identity_reads', 'login_posts', 'checkin_posts']) {
+      assert.deepEqual(fixture.state[counter], fixtureBeforeManual[counter], `manual saves do not perform ${counter}`);
+    }
     const connectorRoute = '/downloads/checkin-assistant-local-connector.zip';
     assert.equal((await api.request(connectorRoute, {auth: false})).status, 404);
     assert.equal((await api.request(connectorRoute, {auth: false,
-      headers: {Authorization: `Bearer ${connection.ticket}`}})).status, 404);
+      headers: {Authorization: `Bearer ${'A'.repeat(43)}`}})).status, 404);
     assert.equal((await api.request(connectorRoute)).status, 404);
     report.manual_entry = {authorization_mode: bootstrap.web.authorization_mode, connector_download_removed: true,
-      connector_runtime_removed: true, saved_without_checkin: saved.status === 'success'};
-    mark('manual entry is the default and retired connector downloads and runtime resources are absent');
-    const descriptor = await api.request(`/api/browser-import/${connection.id}`, {auth: false,
-      headers: {Authorization: `Bearer ${connection.ticket}`}});
-    assert.equal(descriptor.status, 200); assert.ok(!descriptor.text.includes(connection.ticket));
+      connector_runtime_removed: true, extension_download_removed: true, saved_without_site_requests: true,
+      initial_balance_unknown: true, expired_session_saved_locally: expiredSaved.status === 'success'};
+    mark('manual Session saves keep balances unknown and make no site requests, including format-valid expired credentials');
     const before = await api.json('/api/bootstrap'), cookie = api.cookie, staleCsrf = api.csrf;
     const storedBefore = await containerNode(name, PERSISTENCE_INSPECTION);
     assert.equal(storedBefore.credentials_encrypted, true); assert.equal(storedBefore.import_contexts_encrypted, true);
+    assert.equal(storedBefore.active_authorization_records, 0);
+    for (const id of [saved.account_id, expiredSaved.account_id]) {
+      assert.deepEqual(storedBefore.account_snapshots.find(account => account.id === id),
+        {id, balance: null, used_quota: null, total_quota: null, has_snapshot: 0});
+    }
     assert.equal(storedBefore.password_is_hash, true); assert.deepEqual(storedBefore.plaintextFiles, []);
     assert.equal(storedBefore.setup_token_present, false);
     assert.equal(storedBefore.administrator_count, 1); assert.equal(storedBefore.administrator_username, USERNAME);
@@ -290,9 +295,10 @@ async function main() {
       headers: {'X-CSRF-Token': staleCsrf}})).status, 403);
     const after = await api.json('/api/bootstrap'); assert.equal(api.cookie, cookie);
     assert.deepEqual(after.accounts, before.accounts); assert.deepEqual(after.runs, before.runs); assert.deepEqual(after.settings, before.settings);
-    assert.equal(after.authorization.connection.id, connection.id); assert.equal(after.authorization.connection.ticket, connection.ticket);
+    assert.equal(after.authorization, null); assert.equal(after.web.extension_url, undefined);
     const storedAfter = await containerNode(name, PERSISTENCE_INSPECTION);
     assert.equal(storedAfter.key_sha256, storedBefore.key_sha256); assert.deepEqual(storedAfter.account_ids, storedBefore.account_ids);
+    assert.deepEqual(storedAfter.account_snapshots, storedBefore.account_snapshots); assert.equal(storedAfter.active_authorization_records, 0);
     assert.deepEqual(storedAfter.plaintextFiles, []);
     assert.equal(storedAfter.administrator_count, 1); assert.equal(storedAfter.administrator_username, USERNAME);
     assert.equal(storedAfter.administrator_password_hash_sha256, storedBefore.administrator_password_hash_sha256);
@@ -319,29 +325,46 @@ async function main() {
       repeated_setup_issued_session: false, administrator_password_unchanged: true, original_login_after_restart: true});
     mark('restart preserves the chosen administrator and password and rejects setup without replacing credentials or issuing a session');
 
+    const fixtureBeforeReplay = structuredClone(fixture.state);
     const replayed = await api.json('/api/accounts/import', {method: 'POST', body: manualBody});
-    assert.equal(replayed.account_id, saved.account_id);
+    assert.equal(replayed.status, 'success'); assert.equal(replayed.account_id, saved.account_id);
+    const expiredReplayed = await api.json('/api/accounts/import', {method: 'POST', body: expiredBody});
+    assert.equal(expiredReplayed.status, 'success'); assert.equal(expiredReplayed.account_id, expiredSaved.account_id);
+    await assertRetiredAuthorization(api);
     assert.equal((await api.json('/api/bootstrap')).accounts.length, after.accounts.length);
-    const restoredDescriptor = await api.request(`/api/browser-import/${connection.id}`, {auth: false,
-      headers: {Authorization: `Bearer ${connection.ticket}`}});
-    assert.equal(restoredDescriptor.status, 200);
-    const restoredImport = await api.json(`/api/browser-import/${connection.id}`, {method: 'POST', auth: false, csrf: false,
-      headers: {Authorization: `Bearer ${connection.ticket}`}, body: {session: SECRETS.sub, api_user: '11', refresh_token: SECRETS.refresh}});
-    assert.equal(restoredImport.status, 'success');
-    assert.equal((await api.request(`/api/browser-import/${connection.id}`, {auth: false,
-      headers: {Authorization: `Bearer ${connection.ticket}`}})).status, 410);
-    await api.json(`/api/accounts/${saved.account_id}/run`, {method: 'POST', body: {}});
+    for (const counter of ['identity_reads', 'login_posts', 'checkin_posts']) {
+      assert.deepEqual(fixture.state[counter], fixtureBeforeReplay[counter], `manual replay and retired routes do not perform ${counter}`);
+    }
+    assert.equal((await api.json(`/api/accounts/${saved.account_id}/run`, {method: 'POST', body: {}})).queued, true);
     const restoredRun = await until(async () => {
       const bootstrap = await api.json('/api/bootstrap');
       return bootstrap.runs.find(run => run.account_id === saved.account_id && !['queued', 'running'].includes(run.status));
     }, 'decrypted account executes after container restart', 65000);
     assert.equal(restoredRun.status, 'already_checked'); assert.equal(restoredRun.reward, 0);
+    const firstRunState = await api.json('/api/bootstrap');
+    assert.equal(firstRunState.accounts.find(account => account.id === saved.account_id).balance, 51);
+    assert.equal(firstRunState.authorization, null);
+    const fixtureBeforeExpiredRun = structuredClone(fixture.state);
+    assert.equal((await api.json(`/api/accounts/${expiredSaved.account_id}/run`, {method: 'POST', body: {}})).queued, true);
+    const expiredRun = await until(async () => {
+      const state = await api.json('/api/bootstrap');
+      return state.runs.find(run => run.account_id === expiredSaved.account_id && !['queued', 'running'].includes(run.status));
+    }, 'persisted expired Session is checked only on its first explicit run', 65000);
+    assert.equal(expiredRun.status, 'manual_required'); assert.equal(expiredRun.reward, null);
+    assert.equal(expiredRun.before_balance, null); assert.equal(expiredRun.after_balance, null);
+    const expiredAfterRun = (await api.json('/api/bootstrap')).accounts.find(account => account.id === expiredSaved.account_id);
+    assert.equal(expiredAfterRun.status, 'manual_required'); assert.equal(expiredAfterRun.balance, null); assert.equal(expiredAfterRun.used_quota, null);
+    assert.ok(fixture.state.identity_reads.any > fixtureBeforeExpiredRun.identity_reads.any, 'first run actually validates the expired Session');
+    assert.deepEqual(fixture.state.login_posts, fixtureBeforeExpiredRun.login_posts);
+    assert.deepEqual(fixture.state.checkin_posts, fixtureBeforeExpiredRun.checkin_posts, 'expired Session cannot reach a check-in write');
     report.persistence = {key_unchanged: true,administrator_cookie_survived: true,administrator_username: USERNAME,
       administrator_password_unchanged: true,repeated_setup_rejected: true,account_snapshot_survived: true,
-      logs_survived: true,pending_bearer_survived: true,manual_nonce_survived: true,import_after_restart: true,decrypted_run_status: restoredRun.status,
+      initial_unknown_balances_survived: true,logs_survived: true,authorization_queue_absent: true,retired_routes_status: 410,
+      manual_nonce_survived: true,first_run_updates_balance: true,expired_first_run_status: expiredRun.status,decrypted_run_status: restoredRun.status,
       private_storage: await containerNode(name, PERSISTENCE_INSPECTION)};
     assert.deepEqual(report.persistence.private_storage.plaintextFiles, []);
-    mark('container restart retains the key, encrypted accounts, administrator session, logs and pending scoped import');
+    assert.equal(report.persistence.private_storage.active_authorization_records, 0);
+    mark('container restart retains encrypted manual saves and their unknown balances; first runs validate credentials and retired authorization stays absent');
 
     const productionData = path.join(temporary, 'production-data'); await mkdir(productionData, {mode: 0o700});
     const productionPort = await freePort(), productionBase = `http://127.0.0.1:${productionPort}`;
@@ -359,7 +382,9 @@ async function main() {
     assert.equal(productionBootstrap.providers.find(provider => provider.id === 'agentrouter').domain, 'https://agentrouter.org');
     assert.equal(productionBootstrap.providers.length, 2); assert.equal(productionBootstrap.accounts.length, 0);
     assert.equal(productionBootstrap.web.authorization_mode, 'manual'); assert.equal(productionBootstrap.web.remote_browser, false);
+    assert.equal(productionBootstrap.authorization, null); assert.equal(productionBootstrap.web.extension_url, undefined);
     assert.equal(productionBootstrap.web.connector_url, undefined); assert.equal(productionBootstrap.web.connector_version, undefined);
+    report.production_retired_authorization = await assertRetiredAuthorization(productionApi);
     mark('production image ignores the test provider override and defaults to manual credential entry');
 
     report.account_transfer_ui = await runAccountTransferUiSmoke({base: productionBase, password: PASSWORD,

@@ -1,28 +1,25 @@
 import 'dotenv/config';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import yazl from 'yazl';
+import { BrowserResources } from './browser-resources.js';
 import { ACCOUNT_TRANSFER_PATHS, AccountTransfers, MAX_ACCOUNT_TRANSFER_REQUEST_BYTES } from './account-transfer.js';
 import { loadConfig } from './config.js';
 import { HttpError, boundedString, integer, isRecord, positiveId, requireRecord } from './errors.js';
 import { CheckinEngine, browserAvailable } from './engine.js';
-import { IMPORT_PATH, IMPORT_TOKEN, MAX_IMPORT_BYTES, UserBrowserImports } from './imports.js';
+import { MAX_IMPORT_BYTES, UserBrowserImports } from './imports.js';
 import { probeSite } from './probe.js';
 import { PROVIDERS, loadCustomProviders, parseProviderInput, providerCatalog, providerFromConfig, supports } from './providers.js';
 import { normalizeProxy, parseProxyInput } from './proxy.js';
 import { Scheduler } from './scheduler.js';
 import { WebSecurity } from './security.js';
 import { Store } from './store.js';
-import type { AccountInput, AccountRow, AppConfig, LoginMethod, Provider } from './types.js';
+import type { AccountInput, AccountRow, AppConfig, Provider } from './types.js';
 
-const BROWSER_METHODS = ['github', 'linuxdo', 'manual'];
 const CREDENTIAL_METHODS = ['password', 'session'];
-const EXTENSION_FILES = ['manifest.json', 'background.mjs', 'bridge.mjs', 'helpers.mjs', 'popup.html', 'popup.css', 'popup.mjs',
-  'shield.svg', 'README.md', 'icons/16.png', 'icons/32.png', 'icons/48.png', 'icons/128.png'];
 const MANUAL_IMPORT_FIELDS = new Set(['name', 'provider', 'session', 'api_user', 'refresh_token', 'interval_hours', 'proxy', 'account_id', 'request_id']);
 
 export interface AppRuntime {
@@ -34,6 +31,7 @@ export interface AppRuntime {
   imports: UserBrowserImports;
   scheduler: Scheduler;
   engine: CheckinEngine;
+  browserResources: BrowserResources;
   providers: Record<string, Provider>;
   close(): Promise<void>;
 }
@@ -84,10 +82,14 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     await security.ready;
     accountTransfers = new AccountTransfers(store, providers);
   } catch (error) { store.close(); throw error; }
-  const engine = new CheckinEngine({ providers, config, store });
+  const browserResources = new BrowserResources(1);
+  const engine = new CheckinEngine({ providers, config, store, browserResources });
   let scheduler: Scheduler;
-  const imports = new UserBrowserImports(store, providers, security, config, id => scheduler?.isBusy(id) || false);
+  const imports = new UserBrowserImports(store, providers, security, config, id => scheduler?.isBusy(id) || false,
+    undefined, browserResources, true);
   scheduler = new Scheduler(store, engine, config, id => imports.isAuthorizing(id));
+  const probeControllers = new Set<AbortController>();
+  const probeTasks = new Set<Promise<unknown>>();
   const app = express();
   let closing = false;
   app.disable('x-powered-by');
@@ -98,19 +100,13 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
       'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'none'; frame-ancestors 'none'" });
     if (req.path.startsWith('/api/')) res.set('Cache-Control', 'no-store');
+    if (closing && req.path.startsWith('/api/') && req.path !== '/api/health') return next(new HttpError(503, '服务正在重启，请稍后重试。'));
+    if (/^\/api\/(?:login|browser-import)(?:\/|$)/i.test(req.path)
+      || req.path.toLowerCase() === '/downloads/checkin-assistant-browser-extension.zip') {
+      return next(new HttpError(410, '账号连接功能已移除，请在账号表单手动填写并保存。'));
+    }
     if (remoteBrowserPath(req.path)) return next(new HttpError(404, '请在账号表单手工填写原站 Session 与用户 ID，或选择账号密码方式。'));
-    const match = IMPORT_PATH.exec(req.path);
-    if (!match) return security.guard(req, res, next);
-    try {
-      if (!['GET', 'POST'].includes(req.method)) throw new HttpError(405, '该连接接口仅支持查询和导入。', { headers: { Allow: 'GET, POST' } });
-      const origin = req.get('origin');
-      if (origin !== undefined && !security.originAllowed(origin, req.get('host')) && !/^chrome-extension:\/\/[a-p]{32}$/.test(origin)) throw new HttpError(403, '请求来源不受信任。');
-      const bearer = /^Bearer ([A-Za-z0-9_-]{43})$/i.exec(req.get('authorization') || '');
-      if (!bearer || !IMPORT_TOKEN.test(bearer[1])) throw new HttpError(401, '连接码无效，请从签到助手重新复制。');
-      imports.checkTicket(match[1], bearer[1]); res.locals.browserImportTicket = bearer[1];
-      if (req.method === 'POST' && (req.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'application/json') throw new HttpError(415, '导入请求须使用 JSON 格式。');
-      return next();
-    } catch (error) { return next(error); }
+    return security.guard(req, res, next);
   });
   const defaultJson = express.json({ limit: MAX_IMPORT_BYTES, strict: true, verify(req, _res, buffer) {
     const request = req as Request;
@@ -126,13 +122,15 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', runtime: 'node', node: process.version }));
   app.get('/api/bootstrap', (_req, res) => {
     const dashboard = store.dashboard(), catalog = providerCatalog(providers);
+    const accountCounts = new Map<string, number>();
+    for (const row of dashboard.accounts) accountCounts.set(row.provider, (accountCounts.get(row.provider) ?? 0) + 1);
     for (const provider of catalog) {
-      provider.account_count = store.accounts().filter(row => row.provider === provider.id).length;
+      provider.account_count = accountCounts.get(String(provider.id)) ?? 0;
       provider.units_locked = Boolean(provider.account_count || store.db.prepare('SELECT 1 FROM runs WHERE provider=? LIMIT 1').get(String(provider.id)));
     }
     const available = browserAvailable(config);
-    res.json({ ...dashboard, csrf_token: csrf, providers: catalog, authorization: imports.current(false),
-      web: { enabled: true, remote_browser: false, authorization_mode: 'manual', extension_url: '/downloads/checkin-assistant-browser-extension.zip',
+    res.json({ ...dashboard, csrf_token: csrf, providers: catalog, authorization: null,
+      web: { enabled: true, remote_browser: false, authorization_mode: 'manual',
         timezone: config.timezone, max_concurrent_runs: config.maxConcurrentRuns, runtime: 'node' },
       engine: { status: available ? 'ready' : 'browser_required', version: config.version, browser_available: available,
         login_methods: [...CREDENTIAL_METHODS], runtime: 'node' } });
@@ -143,7 +141,7 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     if (!provider || !provider.active) throw new HttpError(404, '站点不存在。');
     if (!provider.custom) throw new HttpError(409, '内置站点不可修改或移除。');
     const rows = store.accounts().filter(row => row.provider === id);
-    if (rows.some(row => scheduler.isBusy(row.id) || ['queued', 'running'].includes(row.status)) || imports.providerPending(id)) throw new HttpError(409, '该站点正在排队、签到或授权，请结束后再修改。');
+    if (rows.some(row => scheduler.isBusy(row.id) || ['queued', 'running'].includes(row.status)) || imports.providerPending(id)) throw new HttpError(409, '该站点正在排队、签到或保存账号，请结束后再修改。');
     return { provider, rows };
   }
 
@@ -154,8 +152,19 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
   app.post('/api/providers/probe', async (req, res) => {
     const body = requireRecord(req.body);
     const input = parseProviderInput({ name: '探测', domain: body.domain });
-    const result = await probeSite(input.domain, config);
-    if (!res.destroyed) res.json(result);
+    const controller = new AbortController();
+    probeControllers.add(controller);
+    const cancel = () => { if (!res.writableEnded) controller.abort(); };
+    res.on('close', cancel);
+    const task = probeSite(input.domain, config, { signal: controller.signal, browserResources });
+    probeTasks.add(task);
+    try {
+      const result = await task;
+      if (!res.destroyed && !closing) res.json(result);
+    } finally {
+      res.off('close', cancel);
+      probeTasks.delete(task); probeControllers.delete(controller);
+    }
   });
   app.post('/api/providers', (req, res) => {
     const input = parseProviderInput(req.body); duplicateDomain(input.domain);
@@ -166,7 +175,7 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
   app.put('/api/providers/:id', (req, res) => {
     const id = String(req.params.id), { provider, rows } = editableProvider(id), input = parseProviderInput(req.body);
     duplicateDomain(input.domain, id);
-    if (rows.length && provider.domain !== input.domain) throw new HttpError(409, '站点已关联账号，不能更改网址；请新增站点并重新授权。');
+    if (rows.length && provider.domain !== input.domain) throw new HttpError(409, '站点已关联账号，不能更改网址；请新增站点并手动添加账号。');
     const history = store.db.prepare('SELECT 1 FROM runs WHERE provider=? LIMIT 1').get(id);
     if ((rows.length || history) && (provider.currency !== input.currency || provider.quota_per_unit !== input.quota_per_unit)) throw new HttpError(409, '站点已有账号或日志，不能更改额度单位与换算；请新增站点。');
     store.saveProvider(id, input); providers[id] = providerFromConfig(id, input);
@@ -179,37 +188,6 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     store.saveProvider(id, record.config, false); providers[id] = providerFromConfig(id, record.config, false);
     res.json({ ok: true });
   });
-
-  app.post('/api/login/start', async (req, res) => {
-    const body = requireRecord(req.body), provider = boundedString(body.provider, 1, 100);
-    const method = body.method ?? 'manual';
-    if (!BROWSER_METHODS.includes(String(method)) || !supports(providers, provider, String(method))) throw new HttpError(422, '登录方式或站点无效。');
-    const name = body.name === undefined || body.name === null ? '' : boundedString(body.name, 0, 40);
-    const accountId = body.account_id === undefined || body.account_id === null ? null : positiveId(body.account_id);
-    if (accountId !== null && scheduler.isBusy(accountId)) throw new HttpError(409, '账号正在排队或运行，暂不能重新授权。');
-    const view = imports.start({ provider, method: method as LoginMethod, name, account_id: accountId,
-      interval_hours: integer(body.interval_hours ?? 6, 1, 168), proxy: body.proxy === undefined || body.proxy === null ? undefined : parseProxyInput(body.proxy),
-      origin: security.publicUrl || `${req.protocol}://${req.get('host')}` });
-    if (accountId !== null) {
-      try { await engine.discardBrowserSessions(accountId); }
-      catch { imports.cancel(view.id); throw new HttpError(409, '旧的后台会话未能关闭，请稍后重新连接。'); }
-    }
-    res.status(202).json(view);
-  });
-  app.get('/api/login/:id', (req, res) => {
-    const view = imports.view(String(req.params.id));
-    if (!view) throw new HttpError(404, '授权会话不存在或已过期。');
-    res.json(view);
-  });
-  app.post('/api/login/:id/cancel', (req, res) => {
-    const id = String(req.params.id), cancelled = imports.cancel(id);
-    res.json({ ok: cancelled, ...imports.view(id) });
-  });
-  app.post('/api/login/:id/import', async (req, res) => res.json(await imports.importCredentials(String(req.params.id), req.body)));
-  app.post('/api/login/:id/resume', () => { throw new HttpError(409, '请在账号表单手工填写原站 Session 与用户 ID，然后校验并保存。'); });
-  app.post('/api/login/:id/continue-oauth', () => { throw new HttpError(409, '请在原站完成登录，再在账号表单手工填写原站 Session 与用户 ID。'); });
-  app.get('/api/browser-import/:id', (req, res) => res.json(imports.checkTicket(String(req.params.id), res.locals.browserImportTicket)));
-  app.post('/api/browser-import/:id', async (req, res) => res.json(await imports.importCredentials(String(req.params.id), req.body, res.locals.browserImportTicket)));
 
   function transferAuthorization(req: Request, res: Response): () => void {
     const owner = security.adminFingerprint();
@@ -259,7 +237,7 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     const id = positiveId(req.params.id), row = store.account(id), body = requireRecord(req.body);
     if (!row) throw new HttpError(404, '账号不存在。');
     if (body.provider !== undefined && body.provider !== row.provider) throw new HttpError(409, '已有账号不能更改平台，请单独添加账号。');
-    if (scheduler.isBusy(id) || ['queued', 'running'].includes(row.status) || imports.isAuthorizing(id)) throw new HttpError(409, '账号正在排队、运行或授权，暂不能编辑。');
+    if (scheduler.isBusy(id) || ['queued', 'running'].includes(row.status) || imports.isAuthorizing(id)) throw new HttpError(409, '账号正在排队、运行或保存，暂不能编辑。');
     const old = store.credentials(row);
     const merged = { name: body.name ?? row.name, provider: row.provider, auth_mode: body.auth_mode ?? row.auth_mode,
       enabled: body.enabled ?? Boolean(row.enabled), interval_hours: body.interval_hours ?? row.interval_hours, ...old };
@@ -274,14 +252,14 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
   });
   app.delete('/api/accounts/:id', async (req, res) => {
     const id = positiveId(req.params.id);
-    if (scheduler.isBusy(id) || imports.isAuthorizing(id) || !store.deleteAccount(id)) throw new HttpError(409, '账号不存在或正在排队、执行任务、授权。');
+    if (scheduler.isBusy(id) || imports.isAuthorizing(id) || !store.deleteAccount(id)) throw new HttpError(409, '账号不存在或正在排队、执行任务、保存。');
     await engine.discardBrowserSessions(id); res.json({ ok: true });
   });
   app.post('/api/accounts/:id/run', (req, res) => {
     const id = positiveId(req.params.id);
     if (!store.account(id)) throw new HttpError(404, '账号不存在。');
-    if (imports.isAuthorizing(id)) throw new HttpError(409, '该账号正在授权，暂不能运行任务。');
-    const queued = scheduler.enqueue(id); res.status(202).json({ queued, ...(!queued ? { message: '该账号已在队列、运行或授权中。' } : {}) });
+    if (imports.isAuthorizing(id)) throw new HttpError(409, '该账号正在保存，暂不能运行任务。');
+    const queued = scheduler.enqueue(id); res.status(202).json({ queued, ...(!queued ? { message: '该账号已在队列、运行或保存中。' } : {}) });
   });
   app.post('/api/run-all', (_req, res) => res.status(202).json({ queued: store.accounts(true).reduce((total, row) => total + Number(scheduler.enqueue(row.id)), 0) }));
   app.patch('/api/settings', (req, res) => {
@@ -300,14 +278,6 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
     };
     res.set({ 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename=checkin-assistant-logs.csv' })
       .send('\ufeff' + lines.map(line => line.map(cell).join(',')).join('\r\n') + '\r\n');
-  });
-  app.get('/downloads/checkin-assistant-browser-extension.zip', (_req, res) => {
-    const directory = path.join(config.resourceRoot, 'browser-extension');
-    if (!EXTENSION_FILES.every(file => existsSync(path.join(directory, file)))) throw new HttpError(404, '浏览器扩展暂不可用。');
-    const zip = new yazl.ZipFile();
-    for (const file of EXTENSION_FILES) zip.addFile(path.join(directory, file), file);
-    res.set({ 'Content-Type': 'application/zip', 'Content-Disposition': 'attachment; filename=checkin-assistant-browser-extension.zip' });
-    zip.outputStream.on('error', () => res.destroy()); zip.outputStream.pipe(res); zip.end();
   });
   app.use('/assets', express.static(path.join(config.resourceRoot, 'web'), { dotfiles: 'deny', redirect: false, fallthrough: false }));
   app.use((req, res, next) => {
@@ -328,10 +298,13 @@ export async function createApp(options: { config?: AppConfig; providers?: Recor
   });
   if (options.startScheduler !== false) scheduler.start();
   let closeTask: Promise<void> | undefined;
-  return { app, config, store, security, accountTransfers, imports, scheduler, engine, providers, close() {
+  return { app, config, store, security, accountTransfers, imports, scheduler, engine, browserResources, providers, close() {
     closing = true;
     if (!closeTask) closeTask = (async () => {
-      try { await imports.close(); await scheduler.close(); } finally { store.close(); }
+      browserResources.shutdown();
+      for (const controller of probeControllers) controller.abort();
+      try { await Promise.allSettled([imports.close(), scheduler.close(), ...probeTasks]); }
+      finally { store.close(); }
     })();
     return closeTask;
   } };

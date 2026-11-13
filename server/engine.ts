@@ -1,7 +1,7 @@
 /** Browsers use temporary, account-owned contexts; secrets remain in encrypted storage. */
 import { createHash, randomBytes } from 'node:crypto';
-import { chromium } from 'playwright-core';
 import type { Browser, BrowserContext, Page, Request, Response, Route } from 'playwright-core';
+import type { BrowserResources } from './browser-resources.js';
 import { detectBrowser, loadConfig } from './config.js';
 import { isRecord } from './errors.js';
 import { isSub2API, profileId, profileSnapshot, resolveCustomProtocol, responseData, roundAmount, ProtocolMismatch } from './protocols.js';
@@ -184,8 +184,9 @@ export class BrowserSession implements JobClient {
   oauth?: OAuthState;
   private launchTask?: Promise<Browser>;
   private closing?: Promise<void>;
+  private browserClosing?: Promise<void>;
+  private releaseResource?: () => void;
   private stopping = false;
-  private browserClosed = false;
   private permits = new Map<string, string>();
   private navigationBarrier?: Promise<void>;
   private installedLoginCapture?: OAuthMethod;
@@ -193,20 +194,49 @@ export class BrowserSession implements JobClient {
   private lastRequest = 0;
   private ownAbort = new AbortController();
   readonly signal: AbortSignal;
-  constructor(public provider: Provider, private config: AppConfig, private proxy: ResolvedProxy | null, signal: AbortSignal) {
+  constructor(public provider: Provider, private config: AppConfig, private proxy: ResolvedProxy | null, signal: AbortSignal,
+    private resources?: BrowserResources) {
     this.signal = AbortSignal.any([signal, this.ownAbort.signal]);
   }
   private check(): void { aborted(this.signal); if (this.stopping) throw new TransportError('aborted'); }
+  private releaseBrowserResource(): void {
+    this.releaseResource?.(); this.releaseResource = undefined;
+  }
   private async closeBrowser(browser: Browser): Promise<void> {
-    if (this.browserClosed) return;
-    this.browserClosed = true;
-    try { await browser.close(); } catch {}
+    if (this.browserClosing) return this.browserClosing;
+    this.browserClosing = (async () => {
+      try { await browser.close(); }
+      catch {
+        // A failed close must not free a slot while Chromium is still alive.
+        if (browser.isConnected()) {
+          const disconnected = () => this.releaseBrowserResource();
+          browser.once('disconnected', disconnected);
+          if (!browser.isConnected()) { browser.off('disconnected', disconnected); this.releaseBrowserResource(); }
+          throw new TransportError('network');
+        }
+      }
+      this.releaseBrowserResource();
+    })();
+    return this.browserClosing;
   }
   async start(credentials: Credentials, upstream: CookieData[] = []): Promise<void> {
     this.check();
     if (!this.config.browserPath) throw new PreflightError(0, true, false);
-    this.launchTask = chromium.launch({ headless: true, executablePath: this.config.browserPath, timeout: 20_000,
-      args: [...(this.proxy ? [] : ['--no-proxy-server']), ...(this.config.browserNoSandbox ? ['--no-sandbox'] : [])] });
+    // Include the lease and lazy Playwright import in the task awaited by close().
+    // Cancellation during a queued or late launch cannot start a second browser.
+    this.launchTask = (async () => {
+      try {
+        if (this.config.lowMemory && this.resources) this.releaseResource = await this.resources.acquire(this.signal);
+        this.check();
+        const { chromium } = await import('playwright-core');
+        this.check();
+        return await chromium.launch({ headless: true, executablePath: this.config.browserPath, timeout: 20_000,
+          args: [...(this.proxy ? [] : ['--no-proxy-server']), ...(this.config.browserNoSandbox ? ['--no-sandbox'] : [])] });
+      } catch (error) {
+        this.releaseBrowserResource();
+        throw error;
+      }
+    })();
     const browser = await this.launchTask;
     this.browser = browser;
     if (this.stopping || this.signal.aborted) { await this.closeBrowser(browser); this.check(); }
@@ -665,11 +695,12 @@ export function classifyCheckinResponse(provider: Provider, response: SiteReply)
   return { status: 'success', message: '签到接口返回成功。', ...(isSub2API(provider) && typeof reward === 'number' && Number.isFinite(reward) && reward >= 0 ? { reward: roundAmount(reward) } : {}) };
 }
 
-export interface EngineOptions { providers?: Record<string, Provider>; config?: AppConfig; store?: ProtocolStore }
+export interface EngineOptions { providers?: Record<string, Provider>; config?: AppConfig; store?: ProtocolStore; browserResources?: BrowserResources }
 export class CheckinEngine {
   private providers: Record<string, Provider>;
   private config: AppConfig;
   private store?: ProtocolStore;
+  private browserResources?: BrowserResources;
   private controllers = new Set<AbortController>();
   private jobs = new Set<Promise<RunResult>>();
   private browsers = new Set<BrowserSession>();
@@ -679,6 +710,7 @@ export class CheckinEngine {
   private closeTask?: Promise<void>;
   constructor(options: EngineOptions = {}) {
     this.providers = options.providers ?? structuredClone(PROVIDERS); this.config = options.config ?? loadConfig(); this.store = options.store;
+    this.browserResources = options.browserResources;
   }
   run(row: AccountRow, credentials: Credentials, hasSnapshot = Boolean(row.has_snapshot)): Promise<RunResult> {
     if (this.stopping) return Promise.resolve({ status: 'interrupted', message: '服务已停止，任务未执行。', duration_ms: 0 });
@@ -717,15 +749,17 @@ export class CheckinEngine {
     const result: RunResult = { status: 'failed', message: '签到未完成。', reward: null };
     try {
       const proxy = resolveProxy(provider, credentials.proxy, this.config);
+      const httpBalance = this.config.lowMemory && provider.name === 'agentrouter' && row.auth_mode === 'session'
+        && !provider.sign_in_path && !upstream.length;
       let client: JobClient;
-      if (provider.bypass_method || provider.waf_cookie_names.length) {
+      if (!httpBalance && (provider.bypass_method || provider.waf_cookie_names.length)) {
         const signature = this.signature(row, credentials, provider), cached = this.cache.get(row.id);
         this.cache.delete(row.id);
         if (cached && cached.signature === signature && cached.session.browser?.isConnected() && !cached.session.page?.isClosed()) {
           browser = cached.session;
         } else {
           if (cached) { await cached.session.close(); this.browsers.delete(cached.session); }
-          browser = new BrowserSession(provider, this.config, proxy, signal); this.browsers.add(browser);
+          browser = new BrowserSession(provider, this.config, proxy, signal, this.browserResources); this.browsers.add(browser);
           await browser.start(row.auth_mode === 'password' ? { ...credentials, session: undefined } : credentials, upstream);
         }
         client = browser;
@@ -738,8 +772,19 @@ export class CheckinEngine {
         }
       }
       let id = profileId(credentials.api_user), loginChecked: boolean | undefined, pendingUpdate: Partial<Credentials> | undefined;
+      let agentLoginBefore: Snapshot | undefined;
       if (row.auth_mode === 'password') {
         if (typeof credentials.email !== 'string' || !credentials.email || typeof credentials.password !== 'string' || !credentials.password) return { ...result, status: 'manual_required', message: '账号密码信息不完整，请编辑账号或使用自己的浏览器重新授权。' };
+        if (provider.name === 'agentrouter' && id && secret(credentials.session) && client instanceof BrowserSession && client.context) {
+          const host = new URL(provider.domain).hostname;
+          try {
+            await client.context.addCookies([{ name: 'session', value: credentials.session, domain: host, path: '/' }]);
+            const live = await readProfile(client, provider, id);
+            if (!live.kind) agentLoginBefore = live.snapshot;
+          } catch { /* An expired or unavailable saved Session must not block password login. */ }
+          try { await client.context.clearCookies({ name: 'session', domain: host }); }
+          catch { return { ...result, status: 'manual_required', message: '无法安全清除旧登录状态，本次未提交账号密码登录；请重新运行。' }; }
+        }
         submitted = true;
         const login = await client.request(provider.login_api_path, null, 'POST', { [isSub2API(provider) ? 'email' : 'username']: credentials.email, password: credentials.password }, false);
         const data = login.status === 200 && !guardedResponse(login) ? responseData(login.body, provider) : null;
@@ -760,6 +805,14 @@ export class CheckinEngine {
       }
       if (!id || row.auth_mode === 'session' && !secret(credentials.session)) return { ...result, status: 'manual_required', message: '登录凭据或用户 ID 无效，请重新授权账号。' };
       let before = await readProfile(client, provider, id);
+      // This fast path is only a balance GET. Password, OAuth and check-in writes
+      // retain their browser transport and existing non-replay submission boundary.
+      if (httpBalance && before.kind === 'waf' && (provider.bypass_method || provider.waf_cookie_names.length)) {
+        browser = new BrowserSession(provider, this.config, proxy, signal, this.browserResources); this.browsers.add(browser);
+        await browser.start(credentials);
+        client = browser;
+        before = await readProfile(client, provider, id);
+      }
       if (isSub2API(provider) && before.response?.status === 401 && row.auth_mode === 'session' && secret(credentials.refresh_token)) {
         submitted = true;
         const refresh = await client.request('/api/v1/auth/refresh', null, 'POST', { refresh_token: credentials.refresh_token }, false);
@@ -792,8 +845,20 @@ export class CheckinEngine {
           result.status = loginChecked === true ? 'success' : 'synced';
           result.message = loginChecked === true ? 'AgentRouter 本次登录确认签到成功。' : loginChecked === false ? 'AgentRouter 本次登录未发放签到奖励。' : 'AgentRouter 登录完成，未返回签到确认标记。';
           delete result.before_balance;
+          if (agentLoginBefore) result.before_balance = agentLoginBefore.balance;
           if (loginChecked === false) result.reward = 0;
-          else if (loginChecked === true) result.message += ' 缺少登录前实时余额，奖励金额暂未确认。';
+          else if (loginChecked === true) {
+            if (!agentLoginBefore || agentLoginBefore.total === null || snapshot.total === null) {
+              result.message += ' 缺少签到前实时额度快照，奖励金额暂未确认。';
+            } else {
+              const increase = roundAmount(snapshot.total - agentLoginBefore.total);
+              if (increase >= 0) {
+                result.reward = increase;
+                const unit = { USD: '$', CNY: '¥', credits: '积分 ' }[provider.currency];
+                result.message += ` 本次额度增加 ${unit}${increase.toFixed(2)}。`;
+              } else result.message += ' 当前总额度低于上次已验证快照，奖励金额暂未确认。';
+            }
+          }
         } else if (provider.name === 'agentrouter' && row.auth_mode === 'session') {
           if (upstream.length && method && browser) {
             const fresh = await this.agentLogin(browser, method, id, credentials, snapshot); submitted ||= browser.oauth?.submitted ?? false;
@@ -827,7 +892,7 @@ export class CheckinEngine {
         ?? (submitted ? '请求可能已发送，尚未确认签到结果；已停止自动重试，请稍后查询余额或到官网确认。' : '后台连接失败或页面加载超时，请检查网络或账号代理后重试。') };
     } finally {
       if (browser) {
-        if (keepBrowser && !this.stopping && !signal.aborted && !browser.signal.aborted) {
+        if (keepBrowser && !this.config.lowMemory && !this.stopping && !signal.aborted && !browser.signal.aborted) {
           const merged = { ...credentials, ...result._session_update };
           this.cache.set(row.id, { session: browser, signature: this.signature(row, merged, provider!), updated: Date.now() });
           while (this.cache.size > Math.max(1, this.config.maxConcurrentRuns)) {

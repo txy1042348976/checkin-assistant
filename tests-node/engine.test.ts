@@ -5,9 +5,10 @@ import test from 'node:test';
 import { chromium } from 'playwright-core';
 import type { Browser, BrowserContext, BrowserContextOptions, LaunchOptions } from 'playwright-core';
 import { detectBrowser, loadConfig } from '../server/config.js';
+import { BrowserResources } from '../server/browser-resources.js';
 import { BrowserSession, CheckinEngine, scopedCookies } from '../server/engine.js';
 import { PROVIDERS, providerFromConfig } from '../server/providers.js';
-import type { AccountRow, CookieData, Credentials, Provider, Template } from '../server/types.js';
+import type { AccountRow, CookieData, Credentials, Provider, RunResult, Template } from '../server/types.js';
 
 const SESSION = 'fixture-site-session';
 const NEW_SESSION = 'fixture-new-session';
@@ -145,11 +146,16 @@ interface BrowserFixtureOptions {
   missingWaf?: boolean;
   xhr?: boolean;
   omitRedirect?: boolean;
+  lowMemory?: boolean;
+  rawWaf?: boolean;
+  rawFailure?: 'unauthorized' | 'identity' | 'money';
 }
 async function browserFixture(t: test.TestContext, options: BrowserFixtureOptions = {}) {
   const provider = structuredClone(PROVIDERS[options.provider ?? 'agentrouter']);
   const method = options.method ?? 'linuxdo';
   const paths: { origin: string; path: string; method: string; cookie: string }[] = [], added: CookieData[][] = [], contexts: BrowserContext[] = [];
+  const failures: { phase: string; name: string; launch: number; navigation: boolean; context_destroyed: boolean;
+    page_closed: boolean; timeout: boolean }[] = [];
   let launches = 0, fresh = false;
   const server = createServer((req, res) => {
     const target = provider.domain, url = new URL(req.url!, target);
@@ -175,6 +181,10 @@ async function browserFixture(t: test.TestContext, options: BrowserFixtureOption
         options.issueSession === false ? {} : { 'Set-Cookie': `session=${NEW_SESSION}; Path=/; HttpOnly; SameSite=Lax` });
     }
     if (url.pathname === provider.user_info_path) {
+      if (options.rawWaf && !String(req.headers.cookie).includes('acw_tc=fixture-waf')) return html('aliyun_waf: local verification required');
+      if (options.rawFailure === 'unauthorized') return json(res, 401, { success: false });
+      if (options.rawFailure === 'identity') return json(res, 200, { success: true, data: { id: 8, quota: 25_000_000, used_quota: 5_000_000 } });
+      if (options.rawFailure === 'money') return json(res, 200, { success: true, data: { id: 7 } });
       if (fresh && options.missingMoney) return json(res, 200, { success: true, data: { id: options.afterId ?? 7 } });
       return json(res, 200, { success: true, data: { id: fresh ? options.afterId ?? 7 : 7, quota: fresh ? 26_000_000 : 25_000_000, used_quota: 5_000_000, checked_in: true } });
     }
@@ -186,6 +196,27 @@ async function browserFixture(t: test.TestContext, options: BrowserFixtureOption
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   provider.domain = `http://127.0.0.1:${address.port}`;
   const target = provider.domain;
+  // Keep production exceptions unchanged. CI diagnostics expose only their
+  // phase/type and allowlisted flags, never raw messages, credentials or URLs.
+  for (const phase of ['start', 'navigate', 'prepareOAuth', 'openOAuth', 'approveOAuth', 'upstreamBlocked', 'request',
+    'settle', 'session', 'siteCookies', 'close'] as const) {
+    const original = BrowserSession.prototype[phase];
+    t.mock.method(BrowserSession.prototype, phase, function (this: BrowserSession, ...args: unknown[]) {
+      const operation: Promise<unknown> = Reflect.apply(original, this, args);
+      return operation.catch((error: unknown) => {
+        const name = error instanceof Error ? error.name : 'UnknownError', message = error instanceof Error ? error.message : '';
+        const failure = { phase, launch: launches,
+          name: ['Error', 'TimeoutError', 'TransportError', 'HttpError', 'ProtocolMismatch', 'PreflightError',
+            'AssertionError', 'TypeError', 'RangeError'].includes(name) ? name : 'UnknownError',
+          navigation: /\bnavigat(?:ion|ing|ed)\b|frame (?:was |has been )?detached/i.test(message),
+          context_destroyed: /Execution context was destroyed|Cannot find context|Execution context is not available/i.test(message),
+          page_closed: /Target page, context or browser has been closed|Target closed|Session closed|Page closed|Browser closed/i.test(message),
+          timeout: name === 'TimeoutError' || /\b(?:timed out|timeout)\b/i.test(message) };
+        failures.push(failure); t.diagnostic(JSON.stringify({ browser_failure: failure }));
+        throw error;
+      });
+    } as typeof original);
+  }
   t.mock.method(chromium, 'launch', async (launchOptions: LaunchOptions) => {
     launches++; assert.equal(launchOptions.headless, true); assert.ok(launchOptions.args?.includes('--no-proxy-server'));
     const browser = await realLaunch(launchOptions), createContext = browser.newContext.bind(browser);
@@ -216,10 +247,14 @@ async function browserFixture(t: test.TestContext, options: BrowserFixtureOption
     });
     return browser;
   });
-  const engine = new CheckinEngine({ providers: { [provider.name]: provider }, config: config() });
+  const resources = new BrowserResources();
+  const engine = new CheckinEngine({ providers: { [provider.name]: provider }, config: { ...config(), lowMemory: options.lowMemory ?? false }, browserResources: resources });
   t.after(async () => { await engine.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); });
   const upstream: CookieData = { name: 'user_session', value: UPSTREAM, domain: method === 'github' ? '.github.com' : '.linux.do', path: '/', secure: true, sameSite: 'Lax', expires: -1 };
-  return { engine, provider, paths, added, contexts, upstream, get launches() { return launches; } };
+  const diagnostic = (result: Pick<RunResult, 'message' | 'duration_ms'>) => JSON.stringify({
+    message: result.message, duration_ms: result.duration_ms, failures,
+    paths: paths.map(({ origin, path, method }) => ({ origin, path, method })) });
+  return { engine, provider, paths, added, contexts, upstream, resources, diagnostic, get launches() { return launches; } };
 }
 
 test('Agent Session-only self response with checked_in=true remains a sync with no login or logout', { skip: !chromePath }, async t => {
@@ -268,7 +303,8 @@ for (const method of ['linuxdo', 'github'] as const) test(`Agent ${method} uses 
 for (const checked of [false, undefined]) test(`Agent fresh login without a true check-in flag remains synced (${checked})`, { skip: !chromePath }, async t => {
   const f = await browserFixture(t, { checked });
   const result = await f.engine.run(row('agentrouter', { login_via: 'linuxdo' }), credentials({ oauth_cookies: [f.upstream] }));
-  assert.equal(result.status, 'synced'); assert.equal(result.after_balance, 52); assert.equal(result.reward, checked === false ? 0 : null);
+  assert.equal(result.status, 'synced', f.diagnostic(result));
+  assert.equal(result.after_balance, 52); assert.equal(result.reward, checked === false ? 0 : null);
 });
 
 test('Agent confirmed login without post-login money saves new session and keeps old database amounts', { skip: !chromePath }, async t => {
@@ -301,6 +337,57 @@ test('Agent reuses its own successful headless context and discards it on reauth
   const third = await f.engine.run(account, { ...creds, ...second._session_update }); assert.equal(third.status, 'success'); assert.equal(f.launches, 2);
 });
 
+test('low-memory Agent OAuth preserves verified login evidence while closing each successful browser', { skip: !chromePath }, async t => {
+  const f = await browserFixture(t, { checked: true, lowMemory: true });
+  const account = row('agentrouter', { login_via: 'linuxdo' }), creds = credentials({ oauth_cookies: [f.upstream] });
+  const first = await f.engine.run(account, creds);
+  assert.equal(first.status, 'success', f.diagnostic(first)); assert.equal(first._session_update!.session, NEW_SESSION);
+  assert.equal(first._session_update!.api_user, '7'); assert.equal(first.reward, 2);
+  assert.equal(f.contexts[0].pages().length, 0); assert.equal(f.resources.activeCount, 0);
+  const second = await f.engine.run(account, { ...creds, ...first._session_update });
+  assert.equal(second.status, 'success', f.diagnostic(second)); assert.equal(second._session_update!.session, NEW_SESSION);
+  assert.equal(f.launches, 2); assert.equal(f.contexts[1].pages().length, 0); assert.equal(f.resources.activeCount, 0);
+  assert.equal(f.paths.filter(call => call.path === '/api/oauth/linuxdo').length, 2);
+});
+
+test('low-memory Agent Session balance uses one raw GET without starting Chromium', async t => {
+  const f = await browserFixture(t, { lowMemory: true });
+  const result = await f.engine.run(row('agentrouter'), credentials());
+  assert.equal(result.status, 'synced'); assert.equal(result.after_balance, 50); assert.equal(result.reward, null);
+  assert.equal(f.launches, 0); assert.equal(f.resources.activeCount, 0);
+  assert.deepEqual(f.paths.map(call => [call.path, call.method]), [['/api/user/self', 'GET']]);
+});
+
+for (const rawFailure of ['unauthorized', 'identity', 'money'] as const) test(`low-memory Agent ${rawFailure} JSON keeps failure semantics without starting a login`, async t => {
+  const f = await browserFixture(t, { lowMemory: true, rawFailure });
+  const result = await f.engine.run(row('agentrouter'), credentials());
+  assert.equal(result.status, rawFailure === 'unauthorized' ? 'manual_required' : 'failed');
+  assert.equal(result.after_balance, undefined); assert.equal(result._session_update, undefined); assert.equal(result.reward, null);
+  assert.equal(f.launches, 0); assert.equal(f.resources.activeCount, 0);
+  assert.deepEqual(f.paths.map(call => [call.path, call.method]), [['/api/user/self', 'GET']]);
+});
+
+test('low-memory Agent balance falls back from raw WAF HTML to one temporary browser and read-only GET', { skip: !chromePath }, async t => {
+  const f = await browserFixture(t, { lowMemory: true, rawWaf: true });
+  const result = await f.engine.run(row('agentrouter'), credentials());
+  assert.equal(result.status, 'synced'); assert.equal(result.after_balance, 50); assert.equal(result.reward, null);
+  assert.equal(f.launches, 1); assert.equal(f.resources.activeCount, 0); assert.equal(f.contexts[0].pages().length, 0);
+  assert.equal(f.paths[0].path, '/api/user/self');
+  assert.equal(f.paths.filter(call => call.path === '/api/user/self').length, 2);
+  assert.equal(f.paths.every(call => call.method === 'GET'), true);
+  assert.equal(f.paths.some(call => call.path.includes('/oauth/') || call.path === '/api/user/logout' || call.path === '/api/user/login'), false);
+});
+
+test('low-memory Any retains WAF browser preparation and makes one check-in submission', { skip: !chromePath }, async t => {
+  const f = await browserFixture(t, { provider: 'anyrouter', lowMemory: true });
+  const result = await f.engine.run(row('anyrouter'), credentials());
+  assert.equal(result.status, 'success'); assert.equal(result.after_balance, 52); assert.equal(result.reward, 2);
+  assert.equal(f.launches, 1); assert.equal(f.resources.activeCount, 0); assert.equal(f.contexts[0].pages().length, 0);
+  assert.equal(f.paths[0].path, '/'); assert.equal(f.paths[0].cookie.includes(SESSION), false);
+  assert.deepEqual(f.paths.filter(call => call.path.startsWith('/api/user')).map(call => [call.path, call.method]),
+    [['/api/user/self', 'GET'], ['/api/user/sign_in', 'POST'], ['/api/user/self', 'GET']]);
+});
+
 test('Agent Axios-style XHR callback retains original response evidence before immediate SPA navigation', { skip: !chromePath }, async t => {
   const f = await browserFixture(t, { checked: true, xhr: true });
   const result = await f.engine.run(row('agentrouter', { login_via: 'linuxdo' }), credentials({ oauth_cookies: [f.upstream] }));
@@ -331,6 +418,7 @@ test('shutdown during asynchronous browser launch closes late browser before any
   t.mock.method(chromium, 'launch', () => { launches++; return new Promise<Browser>(resolve => { release = resolve; }); });
   const engine = new CheckinEngine({ providers: structuredClone(PROVIDERS), config: loadConfig({}, { testMode: true, browserPath: '/synthetic/chromium' }) });
   const run = engine.run(row('anyrouter'), credentials());
+  while (!launches) await new Promise(resolve => setImmediate(resolve));
   assert.equal(launches, 1);
   const closing = engine.close();
   assert.equal((await engine.run(row('anyrouter', { id: 2 }), credentials())).status, 'interrupted');
@@ -347,7 +435,7 @@ test('shutdown during newContext setup prevents routing, cookies or pages after 
   t.mock.method(chromium, 'launch', async () => browser);
   const engine = new CheckinEngine({ providers: structuredClone(PROVIDERS), config: loadConfig({}, { testMode: true, browserPath: '/synthetic/chromium' }) });
   const run = engine.run(row('anyrouter'), credentials());
-  await new Promise(resolve => setImmediate(resolve));
+  while (!release) await new Promise(resolve => setImmediate(resolve));
   const closing = engine.close(); release(context);
   await closing; assert.equal((await run).status, 'interrupted'); assert.equal(closes, 1); assert.equal(setup, 0);
 });
