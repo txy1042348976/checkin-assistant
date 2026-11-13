@@ -76,7 +76,8 @@ test('Agent password compares a fresh saved-Session balance before clearing it a
     const path = new URL(request.url!, 'http://localhost').pathname;
     if (path === '/login') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': 'acw_tc=fixture-waf; Path=/; SameSite=Lax' });
-      return response.end('<!doctype html><title>Fixture</title>');
+      response.end('<!doctype html><title>Fixture</title>');
+      return;
     }
     if (path === '/api/user/login' && request.method === 'POST') {
       assert.equal(String(request.headers.cookie).includes(OLD_SESSION), false);
@@ -111,7 +112,8 @@ test('Agent password still completes when the saved Session cannot provide a fre
     const path = new URL(request.url!, 'http://localhost').pathname;
     if (path === '/login') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Set-Cookie': 'acw_tc=fixture-waf; Path=/; SameSite=Lax' });
-      return response.end('<!doctype html><title>Fixture</title>');
+      response.end('<!doctype html><title>Fixture</title>');
+      return;
     }
     if (path === '/api/user/login' && request.method === 'POST') return json(response, 200,
       { success: true, data: { id: 7, checked_in: true } }, [sessionCookie]);
